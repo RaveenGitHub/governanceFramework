@@ -13,7 +13,7 @@ function loadViewPreferences() {
   try {
     const saved = JSON.parse(sessionStorage.getItem(VIEW_KEY) || "{}");
     return {
-      activeView: ["overview", "stage", "documents", "artifacts", "timeline", "audit", "search"].includes(saved.activeView)
+      activeView: ["overview", "stage", "documents", "artifacts", "timeline", "audit", "search", "access"].includes(saved.activeView)
         ? saved.activeView
         : "overview",
       activeStageId: STAGES.some((stage) => stage.id === saved.activeStageId)
@@ -46,6 +46,9 @@ const state = {
   generatedDocuments: [],
   artifacts: [],
   auditEvents: [],
+  projectMembers: [],
+  projectUsers: [],
+  projectAccessLoadedFor: null,
   stages: STAGES.map((definition, index) => ({
     id: definition.id,
     workStatus: index ? "not_started" : "in_progress",
@@ -133,7 +136,13 @@ async function apiRequest(route, { method = "GET", body, headers = {}, raw = fal
 }
 
 function applyWorkspace(workspace) {
-  state.candidate = workspace.candidate;
+  state.candidate = {
+    ...workspace.candidate,
+    projectRole:
+      workspace.candidate.projectRole ??
+      state.candidates.find((candidate) => candidate.id === workspace.candidate.id)?.project_role ??
+      state.user?.role,
+  };
   state.regressionRisk = workspace.regressionRisk;
   state.stages = workspace.stages.map((stage, index) => ({
     ...stage,
@@ -200,6 +209,59 @@ async function refreshCandidates() {
   else render();
 }
 
+async function loadProjectAccess() {
+  if (state.user?.role !== "admin" || !state.candidate?.projectId) return;
+  const projectId = state.candidate.projectId;
+  const [membersResponse, usersResponse] = await Promise.all([
+    apiRequest(`/api/projects/${encodeURIComponent(projectId)}/members`),
+    apiRequest("/api/auth/roles"),
+  ]);
+  state.projectMembers = membersResponse.data.members;
+  state.projectUsers = usersResponse.data.users.filter((user) => user.active);
+  state.projectAccessLoadedFor = projectId;
+  render();
+}
+
+async function saveProjectMember(userId, role) {
+  const projectId = state.candidate?.projectId;
+  if (!projectId) return;
+  await apiRequest(`/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(userId)}`, {
+    method: "PUT",
+    body: { role },
+  });
+  await loadProjectAccess();
+  showToast("Project membership updated.");
+}
+
+async function removeProjectMember(userId) {
+  const projectId = state.candidate?.projectId;
+  if (!projectId) return;
+  await apiRequest(`/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
+  });
+  await loadProjectAccess();
+  showToast("Project access removed.");
+}
+
+async function createProjectAccount(form) {
+  const formData = new FormData(form);
+  const projectId = state.candidate?.projectId;
+  if (!projectId) return;
+  await apiRequest("/api/auth/users", {
+    method: "POST",
+    body: {
+      username: String(formData.get("username")),
+      displayName: String(formData.get("displayName")),
+      password: String(formData.get("password")),
+      role: "developer",
+      projectId,
+      projectRole: String(formData.get("projectRole")),
+    },
+  });
+  await loadProjectAccess();
+  showToast("Account created and granted project access.");
+}
+
 function connectEvents() {
   eventStream?.close();
   if (!state.authenticated || !state.candidateId || !("EventSource" in window)) return;
@@ -208,6 +270,11 @@ function connectEvents() {
     if (!pendingRequestCount) void loadCandidate().catch(reportError);
   });
   eventStream.addEventListener("reset", () => void loadCandidate().catch(reportError));
+  eventStream.addEventListener("error", () => {
+    eventStream?.close();
+    eventStream = null;
+    void refreshCandidates().then(connectEvents).catch(reportError);
+  });
 }
 
 function reportError(error) {
@@ -230,6 +297,9 @@ async function initialize() {
         state.candidateId = state.candidates[0]?.id ?? null;
       }
       await loadCandidate();
+      if (state.activeView === "access" && state.user?.role === "admin") {
+        await loadProjectAccess();
+      }
       connectEvents();
     }
   } catch (error) {
@@ -424,12 +494,15 @@ function renderSidebar() {
       <button class="primary-nav ${state.activeView === "audit" ? "is-active" : ""}" data-action="navigate" data-view="audit">
         ${icon("activity", 17)}<span>Activity &amp; audit</span>
       </button>
+      ${state.user?.role === "admin" ? `<button class="primary-nav ${state.activeView === "access" ? "is-active" : ""}" data-action="manage-project-access">
+        ${icon("users", 17)}<span>Project access</span>
+      </button>` : ""}
       <div class="sidebar-bottom">
         <div class="sidebar-policy">${icon("shield", 15)}<span>Policy <strong>v${escapeHTML(state.candidate?.policyVersion || "1.0")}</strong></span><span class="policy-status"></span></div>
         <div class="demo-label">${icon("activity", 12)} ${escapeHTML(state.capabilities?.ai?.status || "AI not configured")} · ${escapeHTML(state.capabilities?.malwareScanner?.status || "scanner status unavailable")}</div>
         <div class="user-switcher">
           <span class="user-avatar">${escapeHTML((state.user?.displayName || "U").split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase())}</span>
-          <span class="user-copy"><strong>${escapeHTML(state.user?.displayName || "Signed in")}</strong><small>${escapeHTML(state.user?.role || "")}</small></span>
+          <span class="user-copy"><strong>${escapeHTML(state.user?.displayName || "Signed in")}</strong><small>${escapeHTML(state.candidate?.projectRole || state.user?.role || "")} · project role</small></span>
           <button class="user-copy-action" data-action="logout" aria-label="Sign out">${icon("logout", 16)}</button>
         </div>
       </div>
@@ -467,6 +540,7 @@ function pageTitle() {
     timeline: "Timeline",
     audit: "Activity & audit",
     search: "Search results",
+    access: "Project access",
   }[state.activeView] ?? "Overview";
 }
 
@@ -963,6 +1037,60 @@ function renderAuditPage() {
     </main>`;
 }
 
+function renderProjectAccessPage() {
+    const projectId = state.candidate?.projectId;
+    if (state.user?.role !== "admin") return renderOverview();
+    if (state.projectAccessLoadedFor !== projectId) {
+      return `<main class="main-content resource-main"><section class="panel"><h1>Loading project access…</h1></section></main>`;
+    }
+    const members = state.projectMembers.filter((member) => member.active);
+    const availableUsers = state.projectUsers.filter(
+      (user) => !members.some((member) => member.id === user.id),
+    );
+    return `
+      <main class="main-content resource-main">
+        <div class="page-header resource-page-header">
+          <div><div class="page-eyebrow">PROJECT GOVERNANCE</div><h1>Project access</h1>
+          <p>Assign least-privilege roles for <strong>${escapeHTML(state.candidate?.projectName || "this project")}</strong>. Candidate, evidence, and audit access follows this membership.</p></div>
+          <span class="audit-integrity">${icon("shield", 15)} Membership-scoped access</span>
+        </div>
+        <section class="panel audit-panel">
+          <div class="panel-heading"><div><div class="section-kicker">${members.length} ACTIVE MEMBERS</div><h2>Project members</h2></div></div>
+          ${members.length ? `<div class="project-member-list">${members.map((member) => `
+            <article class="project-member-row">
+              <div class="project-member-copy"><strong>${escapeHTML(member.displayName)}</strong><small>${escapeHTML(member.username)}</small></div>
+              <label class="project-role-control"><span class="sr-only">Role for ${escapeHTML(member.displayName)}</span>
+                <select id="project-role-${escapeHTML(member.id)}" aria-label="Role for ${escapeHTML(member.displayName)}">
+                  ${["admin", "qa_lead", "developer", "auditor"].map((role) => `<option value="${role}" ${member.role === role ? "selected" : ""}>${role.replace("_", " ")}</option>`).join("")}
+                </select>
+              </label>
+              <button class="button button-outline button-small" data-action="update-project-member" data-user="${escapeHTML(member.id)}">Save role</button>
+              <button class="button button-outline button-small danger-button" data-action="remove-project-member" data-user="${escapeHTML(member.id)}">Remove</button>
+            </article>`).join("")}</div>` : `<div class="small-empty-state">No active members are assigned to this project.</div>`}
+        </section>
+        <section class="panel project-member-add-panel">
+          <div class="section-kicker">GRANT PROJECT ACCESS</div><h2>Add a member</h2>
+          ${availableUsers.length ? `<form id="project-member-form" data-project="${escapeHTML(projectId || "")}">
+            <label>User<select name="userId" required>${availableUsers.map((user) => `<option value="${escapeHTML(user.id)}">${escapeHTML(user.displayName)} · ${escapeHTML(user.username)}</option>`).join("")}</select></label>
+            <label>Project role<select name="role" required>${["qa_lead", "developer", "auditor", "admin"].map((role) => `<option value="${role}">${role.replace("_", " ")}</option>`).join("")}</select></label>
+            <button class="button button-primary button-small" type="submit" ${pendingRequestCount ? "disabled" : ""}>${icon("plus", 15)} Add member</button>
+          </form>` : `<p class="small-empty-state">All active users are already members, or no other active accounts exist. Create an account before assigning access.</p>`}
+        </section>
+        <section class="panel project-member-add-panel">
+          <div class="section-kicker">NEW ACCOUNT</div><h2>Create an account for this project</h2>
+          <form id="project-account-form">
+            <label>Display name<input name="displayName" required maxlength="160" autocomplete="name" /></label>
+            <label>Username<input name="username" required maxlength="128" autocomplete="username" /></label>
+            <label>Temporary password<input name="password" type="password" required minlength="12" maxlength="1024" autocomplete="new-password" /></label>
+            <label>Project role<select name="projectRole" required>${["qa_lead", "developer", "auditor", "admin"].map((role) => `<option value="${role}">${role.replace("_", " ")}</option>`).join("")}</select></label>
+            <button class="button button-primary button-small" type="submit" ${pendingRequestCount ? "disabled" : ""}>Create account</button>
+          </form>
+          <p class="audit-integrity-footer">The account starts with the developer baseline role; its project membership determines its effective project permissions. The temporary password is sent once and is not retained in the browser.</p>
+        </section>
+        <p class="audit-integrity-footer">Global administrators retain control-plane access. Project roles do not grant access to other projects or global user administration.</p>
+      </main>`;
+}
+
 function renderSearchPage() {
   const query = state.searchQuery.trim().toLowerCase();
   const matches = [];
@@ -1047,7 +1175,8 @@ function renderAuthentication() {
 }
 
 function renderNoCandidate() {
-  return `<main class="main-content empty-workspace"><section class="panel"><div class="section-kicker">RELEASE WORKSPACE</div><h1>No release candidates</h1><p>Create a candidate to start the six-stage governance flow. Candidate state is persisted on this server.</p><button class="button button-primary" data-action="new-candidate">${icon("plus", 16)} Create release candidate</button></section></main>`;
+  const isAdmin = state.user?.role === "admin";
+  return `<main class="main-content empty-workspace"><section class="panel"><div class="section-kicker">RELEASE WORKSPACE</div><h1>${isAdmin ? "No release candidates" : "No project access"}</h1><p>${isAdmin ? "Create a candidate to start the six-stage governance flow. Candidate state is persisted on this server." : "You do not have access to a project yet. Ask an administrator to add you to a project before starting governance work."}</p>${isAdmin ? `<button class="button button-primary" data-action="new-candidate">${icon("plus", 16)} Create release candidate</button>` : ""}</section></main>`;
 }
 
 function render() {
@@ -1076,7 +1205,9 @@ function render() {
               ? renderTimelinePage()
               : state.activeView === "audit"
                 ? renderAuditPage()
-                : renderSearchPage();
+                : state.activeView === "access"
+                  ? renderProjectAccessPage()
+                  : renderSearchPage();
   app.innerHTML = `${renderSidebar()}<div class="app-shell">${renderTopbar()}${view}</div>${renderModal()}${renderToast()}`;
   if (state.currentModal) {
     const dialog = $(".modal");
@@ -1416,6 +1547,18 @@ function handleAction(button) {
       }
       break;
     }
+    case "manage-project-access":
+      setView("access");
+      void loadProjectAccess().catch(reportError);
+      break;
+    case "update-project-member": {
+      const role = document.getElementById(`project-role-${button.dataset.user}`)?.value;
+      if (role) void saveProjectMember(button.dataset.user, role).catch(reportError);
+      break;
+    }
+    case "remove-project-member":
+      void removeProjectMember(button.dataset.user).catch(reportError);
+      break;
     case "toggle-sidebar":
       $("#sidebar")?.classList.toggle("sidebar-open");
       break;
@@ -1594,7 +1737,10 @@ document.addEventListener("change", (event) => {
   } else if (event.target.matches("#candidate-select")) {
     state.candidateId = event.target.value;
     persist();
-    void loadCandidate().then(connectEvents).catch(reportError);
+    void loadCandidate().then(async () => {
+      connectEvents();
+      if (state.activeView === "access") await loadProjectAccess();
+    }).catch(reportError);
   } else if (event.target.matches('input[type="checkbox"][data-action="checklist"]')) {
     handleAction(event.target);
   }
@@ -1624,7 +1770,7 @@ document.addEventListener("drop", (event) => {
 
 document.addEventListener("submit", (event) => {
   const form = event.target;
-  if (!["search-form", "auth-form", "artifact-form", "disposition-form", "candidate-form"].includes(form.id)) return;
+  if (!["search-form", "auth-form", "artifact-form", "disposition-form", "candidate-form", "project-member-form", "project-account-form"].includes(form.id)) return;
   event.preventDefault();
   if (form.id === "search-form") {
     state.searchQuery = $("#global-search")?.value.trim() ?? "";
@@ -1638,6 +1784,11 @@ document.addEventListener("submit", (event) => {
     void submitDisposition(form).catch(reportError);
   } else if (form.id === "candidate-form") {
     void createCandidate(form).catch(reportError);
+  } else if (form.id === "project-member-form") {
+    const formData = new FormData(form);
+    void saveProjectMember(String(formData.get("userId")), String(formData.get("role"))).catch(reportError);
+  } else if (form.id === "project-account-form") {
+    void createProjectAccount(form).catch(reportError);
   }
 });
 

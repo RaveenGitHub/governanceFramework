@@ -46,6 +46,16 @@ db.exec(`
     updated_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS project_memberships (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'qa_lead', 'developer', 'auditor')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, user_id)
+  ) WITHOUT ROWID;
+  CREATE INDEX IF NOT EXISTS project_memberships_user_idx ON project_memberships(user_id, project_id);
+
   CREATE TABLE IF NOT EXISTS candidates (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -201,6 +211,12 @@ function now() {
   return new Date().toISOString();
 }
 
+db.prepare(
+  `INSERT OR IGNORE INTO project_memberships (project_id, user_id, role, created_at, updated_at)
+   SELECT projects.id, projects.created_by, users.role, projects.created_at, projects.updated_at
+     FROM projects JOIN users ON users.id = projects.created_by`,
+).run();
+
 function safeJson(value, fallback) {
   try {
     return value === null ? fallback : JSON.parse(value);
@@ -309,6 +325,11 @@ export function createCandidate({ id = randomUUID(), projectName, releaseName, c
       "INSERT INTO projects (id, name, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
     ).run(projectId, projectName, actor.id, timestamp, timestamp);
   }
+  db.prepare(
+    `INSERT INTO project_memberships (project_id, user_id, role, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(project_id, user_id) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
+  ).run(projectId, actor.id, actor.role, timestamp, timestamp);
 
   db.prepare(
     `INSERT INTO candidates
@@ -347,6 +368,71 @@ export function findCandidate(id) {
     .get(id);
 }
 
+export function getCandidateProjectId(candidateId) {
+  return db.prepare("SELECT project_id AS projectId FROM candidates WHERE id = ?").get(candidateId)?.projectId ?? null;
+}
+
+export function getProjectMembership(userId, projectId) {
+  return db
+    .prepare("SELECT role FROM project_memberships WHERE user_id = ? AND project_id = ?")
+    .get(userId, projectId)?.role ?? null;
+}
+
+export function listProjectsForUser(userId, isAdmin = false) {
+  const where = isAdmin ? "" : "WHERE project_memberships.user_id = ?";
+  const values = isAdmin ? [] : [userId];
+  return db
+    .prepare(
+      `SELECT projects.id, projects.name, projects.created_at AS createdAt,
+              projects.updated_at AS updatedAt,
+              count(DISTINCT candidates.id) AS candidateCount
+         FROM projects
+         LEFT JOIN candidates ON candidates.project_id = projects.id
+         ${isAdmin ? "" : "JOIN project_memberships ON project_memberships.project_id = projects.id"}
+         ${where}
+        GROUP BY projects.id
+        ORDER BY projects.name COLLATE NOCASE`,
+    )
+    .all(...values);
+}
+
+export function listProjectMembers(projectId) {
+  return db
+    .prepare(
+      `SELECT users.id, users.username, users.display_name AS displayName,
+              users.active, project_memberships.role,
+              project_memberships.created_at AS addedAt,
+              project_memberships.updated_at AS updatedAt
+         FROM project_memberships
+         JOIN users ON users.id = project_memberships.user_id
+        WHERE project_memberships.project_id = ?
+        ORDER BY users.display_name COLLATE NOCASE`,
+    )
+    .all(projectId);
+}
+
+export function projectExists(projectId) {
+  return Boolean(db.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId));
+}
+
+export function activeUserExists(userId) {
+  return Boolean(db.prepare("SELECT 1 FROM users WHERE id = ? AND active = 1").get(userId));
+}
+
+export function setProjectMembership({ projectId, userId, role }) {
+  const timestamp = now();
+  db.prepare(
+    `INSERT INTO project_memberships (project_id, user_id, role, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(project_id, user_id) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
+  ).run(projectId, userId, role, timestamp, timestamp);
+  return getProjectMembership(userId, projectId);
+}
+
+export function removeProjectMembership(projectId, userId) {
+  return db.prepare("DELETE FROM project_memberships WHERE project_id = ? AND user_id = ?").run(projectId, userId).changes > 0;
+}
+
 export function getCandidate(id) {
   const candidate = findCandidate(id);
   if (!candidate) return null;
@@ -373,14 +459,22 @@ function hydrateStage(stage) {
   };
 }
 
-export function listCandidates() {
+export function listCandidates({ userId, isAdmin = false } = {}) {
+  const accessJoin = userId && !isAdmin
+    ? "JOIN project_memberships ON project_memberships.project_id = candidates.project_id AND project_memberships.user_id = ?"
+    : "";
+  const roleColumn = userId && !isAdmin
+    ? "project_memberships.role AS project_role"
+    : "'admin' AS project_role";
+  const accessValues = userId && !isAdmin ? [userId] : [];
   return db
     .prepare(
-      `SELECT candidates.*, projects.name AS project_name
+      `SELECT candidates.*, projects.name AS project_name, ${roleColumn}
          FROM candidates JOIN projects ON projects.id = candidates.project_id
+         ${accessJoin}
         ORDER BY candidates.updated_at DESC`,
     )
-    .all()
+    .all(...accessValues)
     .map((candidate) => ({
       ...candidate,
       stages: db
@@ -666,6 +760,14 @@ export function getArtifact(id) {
     .get(id);
   if (!artifact) return null;
   return { ...artifact, files: safeJson(artifact.files_json, []), files_json: undefined };
+}
+
+export function artifactExistsForPullRequest(candidateId, pullRequestNumber) {
+  return Boolean(
+    db
+      .prepare("SELECT 1 FROM artifacts WHERE candidate_id = ? AND pull_request_url LIKE ? LIMIT 1")
+      .get(candidateId, `%/pull/${pullRequestNumber}`),
+  );
 }
 
 export function listArtifacts(candidateId) {

@@ -196,6 +196,44 @@ test("authenticated API persists candidates and enforces RBAC, CSRF, revisions, 
   assert.equal(workspace.stages[0].gateStatus, "not_run");
   assert.equal(workspace.stages[1].gateStatus, "locked");
 
+  const otherCandidateResponse = await requestJson(baseUrl, "/api/candidates", {
+    method: "POST",
+    cookie: adminCookie,
+    csrf: setupPayload.csrfToken,
+    body: { projectName: "Restricted Project", releaseName: "2.0" },
+  });
+  assert.equal(otherCandidateResponse.status, 201, output());
+  const otherCandidate = await otherCandidateResponse.json();
+  const otherEvidenceUpload = await fetch(
+    `${baseUrl}/api/evidence/upload?candidateId=${otherCandidate.candidate.id}&stageId=requirements`,
+    {
+      method: "POST",
+      headers: {
+        Cookie: adminCookie,
+        "X-CSRF-Token": setupPayload.csrfToken,
+        "If-Match": otherCandidateResponse.headers.get("etag"),
+        "Content-Type": "application/octet-stream",
+        "X-Evidence-Filename": Buffer.from("restricted-requirements.md").toString("base64url"),
+      },
+      body: Buffer.from("# Restricted project evidence\nPrivate requirements.", "utf8"),
+    },
+  );
+  assert.equal(otherEvidenceUpload.status, 201, output());
+  const otherEvidence = await otherEvidenceUpload.json();
+  const otherDocumentResponse = await requestJson(
+    baseUrl,
+    `/api/candidates/${otherCandidate.candidate.id}/stages/requirements/documents`,
+    {
+      method: "POST",
+      cookie: adminCookie,
+      csrf: setupPayload.csrfToken,
+      etag: otherEvidenceUpload.headers.get("etag"),
+      body: { format: "markdown" },
+    },
+  );
+  assert.equal(otherDocumentResponse.status, 201, output());
+  const otherDocument = await otherDocumentResponse.json();
+
   const checklistPath = `/api/candidates/${candidateId}/stages/requirements/checklist`;
   const missingCsrf = await requestJson(baseUrl, checklistPath, {
     method: "PUT",
@@ -303,6 +341,131 @@ test("authenticated API persists candidates and enforces RBAC, CSRF, revisions, 
   assert.equal(login.status, 200, output());
   const loginPayload = await login.json();
   const developerCookie = login.headers.get("set-cookie").split(";")[0];
+  assert.deepEqual(
+    (await (await requestJson(baseUrl, "/api/candidates", { cookie: developerCookie })).json()).candidates,
+    [],
+  );
+
+  const adminReauth = await requestJson(baseUrl, "/api/auth/login", {
+    method: "POST",
+    body: { username: "governance-admin", password: "correct horse battery staple" },
+  });
+  assert.equal(adminReauth.status, 200);
+  const adminReauthPayload = await adminReauth.json();
+  const adminReauthCookie = adminReauth.headers.get("set-cookie").split(";")[0];
+  const projectsResponse = await requestJson(baseUrl, "/api/projects", { cookie: adminReauthCookie });
+  const projects = (await projectsResponse.json()).projects;
+  const workspaceProject = projects.find((project) => project.name === workspace.candidate.projectName);
+  assert.ok(workspaceProject);
+  const createScopedAccount = await requestJson(baseUrl, "/api/auth/users", {
+    method: "POST",
+    cookie: adminReauthCookie,
+    csrf: adminReauthPayload.csrfToken,
+    body: {
+      username: "scoped-auditor",
+      displayName: "Scoped Auditor",
+      role: "developer",
+      projectId: workspaceProject.id,
+      projectRole: "auditor",
+      password: "another secure governance password",
+    },
+  });
+  assert.equal(createScopedAccount.status, 201, output());
+  assert.deepEqual((await createScopedAccount.json()).projectMembership, {
+    projectId: workspaceProject.id,
+    role: "auditor",
+  });
+  const addProjectMember = await requestJson(
+    baseUrl,
+    `/api/projects/${workspaceProject.id}/members/${loginPayload.user.id}`,
+    {
+      method: "PUT",
+      cookie: adminReauthCookie,
+      csrf: adminReauthPayload.csrfToken,
+      body: { role: "developer" },
+    },
+  );
+  assert.equal(addProjectMember.status, 200, output());
+  const scopedCandidates = await requestJson(baseUrl, "/api/candidates", { cookie: developerCookie });
+  assert.deepEqual(
+    (await scopedCandidates.json()).candidates.map((candidate) => candidate.id),
+    [candidateId],
+  );
+  assert.equal((await (await requestJson(baseUrl, "/api/projects", { cookie: developerCookie })).json()).projects.length, 1);
+  const projectRoleState = await requestJson(baseUrl, `/api/candidates/${candidateId}/state`, { cookie: developerCookie });
+  assert.equal((await projectRoleState.json()).candidate.projectRole, "developer");
+  const crossProjectState = await requestJson(
+    baseUrl,
+    `/api/candidates/${otherCandidate.candidate.id}/state`,
+    { cookie: developerCookie },
+  );
+  assert.equal(crossProjectState.status, 404);
+  for (const route of [
+    `/api/release/confidence?candidateId=${otherCandidate.candidate.id}`,
+    `/api/evidence/list?candidateId=${otherCandidate.candidate.id}&stageId=requirements`,
+    `/api/evidence/${otherEvidence.evidence.id}`,
+    `/api/documents/${otherDocument.id}?candidateId=${otherCandidate.candidate.id}`,
+    `/api/audit/logs?candidateId=${otherCandidate.candidate.id}`,
+    `/api/events?candidateId=${otherCandidate.candidate.id}`,
+  ]) {
+    const denied = await requestJson(baseUrl, route, { cookie: developerCookie });
+    assert.equal(denied.status, 404, `${route} must remain project-scoped`);
+  }
+  assert.equal((await requestJson(baseUrl, "/api/events", { cookie: developerCookie })).status, 400);
+  assert.equal((await requestJson(baseUrl, "/api/audit/logs", { cookie: developerCookie })).status, 400);
+
+  const setProjectAuditor = await requestJson(
+    baseUrl,
+    `/api/projects/${workspaceProject.id}/members/${loginPayload.user.id}`,
+    {
+      method: "PUT",
+      cookie: adminReauthCookie,
+      csrf: adminReauthPayload.csrfToken,
+      body: { role: "auditor" },
+    },
+  );
+  assert.equal(setProjectAuditor.status, 200);
+  const auditorState = await requestJson(baseUrl, `/api/candidates/${candidateId}/state`, { cookie: developerCookie });
+  const projectAuditorMutation = await requestJson(
+    baseUrl,
+    `/api/candidates/${candidateId}/stages/requirements/checklist`,
+    {
+      method: "PUT",
+      cookie: developerCookie,
+      csrf: loginPayload.csrfToken,
+      etag: auditorState.headers.get("etag"),
+      body: { index: 1, checked: true },
+    },
+  );
+  assert.equal(projectAuditorMutation.status, 403);
+  const projectEventStream = await fetch(`${baseUrl}/api/events?candidateId=${candidateId}`, {
+    headers: { Cookie: developerCookie },
+  });
+  assert.equal(projectEventStream.status, 200);
+  const streamClosed = (async () => {
+    for await (const _chunk of projectEventStream.body) {
+      // Drain queued governance events until membership revocation closes the stream.
+    }
+    return true;
+  })();
+  const removeProjectMember = await requestJson(
+    baseUrl,
+    `/api/projects/${workspaceProject.id}/members/${loginPayload.user.id}`,
+    {
+      method: "DELETE",
+      cookie: adminReauthCookie,
+      csrf: adminReauthPayload.csrfToken,
+    },
+  );
+  assert.equal(removeProjectMember.status, 204);
+  assert.equal(await Promise.race([
+    streamClosed,
+    new Promise((resolve) => setTimeout(() => resolve(false), 1000)),
+  ]), true);
+  assert.equal(
+    (await requestJson(baseUrl, `/api/candidates/${candidateId}/state`, { cookie: developerCookie })).status,
+    404,
+  );
 
   const forbiddenCandidate = await requestJson(baseUrl, "/api/candidates", {
     method: "POST",

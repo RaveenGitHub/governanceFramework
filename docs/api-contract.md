@@ -22,11 +22,20 @@ Mutating browser requests use the `governance_session` HttpOnly cookie, `X-CSRF-
 | `POST` | `/api/auth/logout` | Revoke current session |
 | `POST` | `/api/auth/password` | Change password and revoke other sessions |
 | `GET` | `/api/auth/roles` | Admin-only user and role listing |
-| `POST` | `/api/auth/users` | Admin-only user creation |
+| `POST` | `/api/auth/users` | Admin-only user creation; optionally include `projectId` and `projectRole` to create the account and membership atomically |
 | `PATCH` | `/api/auth/roles/{userId}` | Admin-only role change; revokes target sessions |
 | `DELETE` | `/api/auth/users/{userId}` | Admin-only user deactivation |
 
 ## Candidates and workflow
+
+Project access is membership-scoped. Global administrators can see all projects; all other users can only see candidate data for projects where they have an active membership. Their project role (`admin`, `qa_lead`, `developer`, or `auditor`) governs candidate operations and takes precedence over their account-wide role for that project. Candidate IDs do not grant access. Non-admin event-stream and audit queries must specify a candidate. Global account administration remains restricted to global administrators.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/projects` | List projects the authenticated user may access (administrators see all) |
+| `GET` | `/api/projects/{projectId}/members` | Admin-only project membership listing |
+| `PUT` | `/api/projects/{projectId}/members/{userId}` | Admin-only membership assignment or role update; JSON body `{ "role": "developer" }` |
+| `DELETE` | `/api/projects/{projectId}/members/{userId}` | Admin-only project membership removal |
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -52,6 +61,8 @@ Mutating browser requests use the `governance_session` HttpOnly cookie, `X-CSRF-
 
 The six stage IDs are `requirements`, `architecture`, `code`, `tests`, `cicd`, and `production`. A gate cannot pass unless prerequisites, required evidence, evidence cleanliness, current confirmation, checklist, validation, and reviewer policy pass. Approval is separate from validation. Release confidence is a deterministic policy index, **not** an AI probability; the optional AI integration only provides advisory analysis.
 
+Release authorization is valid only while its source commit, artifact digest, policy version, six validation IDs, evidence revisions, confirmations, and separate approvals remain current. Changing candidate inputs or revalidating a stage invalidates the previous authorization for release tagging. Authorization records a decision; it does not deploy.
+
 ## Evidence, documents and artifacts
 
 | Method | Path | Purpose |
@@ -75,7 +86,7 @@ Uploads are stored privately and quarantined until the configured scanner report
 | `GET` | `/api/repo/status` | Configured GitHub repository status |
 | `GET` | `/api/repo/commit-status?sha={sha}` | GitHub commit status |
 | `POST` | `/api/repo/push` | Submit a stored artifact as a review pull request (never direct push) |
-| `POST` | `/api/repo/pull-request-comment` | Add a permissioned PR review comment |
+| `POST` | `/api/repo/pull-request-comment` | Add a permissioned comment for a PR linked to the candidate artifact; requires `candidateId`, `number`, `body`, and candidate ETag |
 | `POST` | `/api/github/webhook` | Verify configured GitHub HMAC-signed webhook |
 | `POST` | `/api/cicd/coverage` | Public webhook endpoint verifying HMAC-signed CI coverage and unique delivery identifier |
 | `GET` | `/api/events?candidateId={id}` | Server-Sent Events stream for governance/audit updates |
@@ -84,6 +95,8 @@ Uploads are stored privately and quarantined until the configured scanner report
 Webhook endpoints authenticate using HMAC over the exact raw request body and do not require a browser session. CI deliveries include the same unique ID in the signed JSON body and `X-CI-Delivery` header. Delivery identifiers and payload digests are persisted transactionally with their state updates. An exact retry is acknowledged without applying it again (`202` and `duplicateDelivery: true` for GitHub, `200` and `duplicateDelivery: true` for CI); reuse of an identifier for a different signed payload returns `409`. Configure source restrictions at the TLS-terminating proxy and rotate secrets according to policy before exposing webhook endpoints externally.
 
 When stage policy validation is committed but the optional GitHub commit-status update fails, the validation remains persisted. Its response includes `integrations.githubCommitStatus.status: "failed"` and an audit event; the UI reports that mismatch instead of implying synchronization succeeded. A repository pull request that finishes after the candidate identity changes is recorded as `stale_candidate` with its URL so that the created external resource is not lost or mistaken for a proposal against the current candidate.
+
+Repository comments require `candidateId` in the request body, the current candidate `If-Match` ETag, project membership, and a pull request associated with an artifact in that candidate.
 
 Evidence removal deletes its database record and queues the private-file cleanup in one transaction. A failed unlink is reported to the caller, retained in the cleanup queue, and retried periodically and on service startup. Infected rescans use the same tracked cleanup mechanism.
 

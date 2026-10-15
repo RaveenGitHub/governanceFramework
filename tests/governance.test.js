@@ -7,6 +7,7 @@ import {
   calculateProgress,
   evaluateStage,
   formatMetric,
+  isReleaseAuthorizationCurrent,
 } from "../src/governance.js";
 import { validateProposal } from "../src/server/github.mjs";
 
@@ -169,4 +170,47 @@ test("missing numeric evidence fails closed and formats without fabricating zero
 test("the stage validator rejects missing stage definitions and state", () => {
   assert.throws(() => evaluateStage(undefined, {}), TypeError);
   assert.throws(() => evaluateStage(STAGES[0], undefined), TypeError);
+});
+
+test("release authorization stays current only for the exact approved validation set", () => {
+  const candidate = {
+    commit_sha: "a".repeat(40),
+    artifact_digest: `sha256:${"b".repeat(64)}`,
+    policy_version: "1.0",
+    stages: STAGES.map((stage, index) => ({
+      stage_id: stage.id,
+      gate_status: "passed",
+      evidence_revision: 3,
+      confirmed_evidence_revision: 3,
+      validation: {
+        id: `validation-${index}`,
+        outcome: "passed",
+        evidenceRevision: 3,
+        policyVersion: "1.0",
+      },
+      approver_id: `approver-${index}`,
+      approved_at: "2026-10-15T00:00:00.000Z",
+    })),
+  };
+  const authorization = {
+    commitSha: candidate.commit_sha,
+    artifactDigest: candidate.artifact_digest,
+    policyVersion: candidate.policy_version,
+    validationIds: candidate.stages.map((stage) => stage.validation.id),
+  };
+
+  assert.equal(isReleaseAuthorizationCurrent(candidate, authorization), true);
+  assert.equal(
+    isReleaseAuthorizationCurrent(candidate, { ...authorization, validationIds: [] }),
+    false,
+  );
+  const changedEvidence = structuredClone(candidate);
+  changedEvidence.stages[0].evidence_revision += 1;
+  assert.equal(isReleaseAuthorizationCurrent(changedEvidence, authorization), false);
+  const changedPolicy = structuredClone(candidate);
+  changedPolicy.policy_version = "2.0";
+  assert.equal(isReleaseAuthorizationCurrent(changedPolicy, authorization), false);
+  const missingApproval = structuredClone(candidate);
+  missingApproval.stages[0].approver_id = null;
+  assert.equal(isReleaseAuthorizationCurrent(missingApproval, authorization), false);
 });

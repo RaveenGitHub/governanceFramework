@@ -3,6 +3,7 @@ import {
   STAGES,
   calculateProgress,
   evaluateStage,
+  isReleaseAuthorizationCurrent,
 } from "../governance.js";
 import {
   appendEvent,
@@ -165,11 +166,7 @@ export function publicCandidate(candidateId) {
   );
   const releaseAuthorization = storedAuthorization
     ? {
-        authorized:
-          storedAuthorization.commitSha === candidate.commit_sha &&
-          storedAuthorization.artifactDigest === candidate.artifact_digest &&
-          storedAuthorization.policyVersion === candidate.policy_version &&
-          stages.every((stage) => stage.gateStatus === "passed"),
+        authorized: isReleaseAuthorizationCurrent(candidate, storedAuthorization),
         authorizedAt: storedAuthorization.authorizedAt,
         commitSha: storedAuthorization.commitSha,
         artifactDigest: storedAuthorization.artifactDigest,
@@ -1018,10 +1015,20 @@ export function authorizeRelease({ candidateId, request, actor }) {
   const current = getCandidate(candidateId);
   const stages = current.stages;
   assert(
-    stages.length === STAGES.length && stages.every((stage) => stage.gate_status === "passed"),
+    stages.length === STAGES.length &&
+      stages.every(
+        (stage) =>
+          stage.gate_status === "passed" &&
+          stage.validation?.outcome === "passed" &&
+          stage.validation.evidenceRevision === stage.evidence_revision &&
+          stage.validation.policyVersion === candidate.policy_version &&
+          stage.confirmed_evidence_revision === stage.evidence_revision &&
+          stage.approver_id &&
+          stage.approved_at,
+      ),
     409,
     "release_gates_incomplete",
-    "All six governance gates must pass before production release authorization.",
+    "All six gates must have current, passing validations, current evidence confirmations, and separate reviewer approvals before release authorization.",
     { gates: stages.map(({ stage_id, gate_status }) => ({ stageId: stage_id, status: gate_status })) },
   );
   const totalClean = listAllCandidateEvidence(candidateId).every((item) => item.scanStatus === "clean");
@@ -1075,15 +1082,19 @@ export async function createAuthorizedReleaseTag({ candidateId, tag, message, ac
   assert(actor.role === "admin", 403, "role_forbidden", "Only an administrator may create a release tag.");
   const authorization = getReleaseAuthorization(candidateId);
   assert(authorization, 409, "release_not_authorized", "Record final production authorization before creating a release tag.");
+  const snapshot = getCandidate(candidateId);
   assert(
-    authorization.commitSha === candidate.commit_sha &&
-      authorization.artifactDigest === candidate.artifact_digest,
+    isReleaseAuthorizationCurrent(snapshot, authorization),
     409,
     "release_candidate_changed",
-    "The pinned source or artifact changed after release authorization. Authorize the current candidate again.",
+    "The candidate identity, policy, evidence, validation, or approval changed after release authorization. Authorize the current candidate again.",
   );
-  const snapshot = getCandidate(candidateId);
-  assert(snapshot.stages.every((stage) => stage.gate_status === "passed"), 409, "release_gates_incomplete", "All six governance gates must remain valid before creating a release tag.");
+  assert(
+    listAllCandidateEvidence(candidateId).every((item) => item.scanStatus === "clean"),
+    409,
+    "release_evidence_not_clean",
+    "All candidate evidence must remain malware-scanned and clean before creating a release tag.",
+  );
   const result = await createReleaseTag({
     tag,
     targetSha: candidate.commit_sha,

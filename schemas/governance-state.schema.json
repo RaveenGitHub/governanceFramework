@@ -180,6 +180,7 @@
         "commitSha",
         "artifactDigest",
         "policyVersion",
+        "projectRole",
         "revision",
         "createdAt",
         "updatedAt"
@@ -208,6 +209,9 @@
         "policyVersion": {
           "type": "string",
           "minLength": 1
+        },
+        "projectRole": {
+          "enum": ["admin", "qa_lead", "developer", "auditor"]
         },
         "revision": {
           "type": "integer",

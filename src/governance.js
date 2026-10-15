@@ -276,6 +276,30 @@ export const STAGES = [
 
 const FINAL_GATE_STATUSES = new Set(["passed"]);
 
+export function isReleaseAuthorizationCurrent(candidate, authorization) {
+  const stages = candidate.stages || [];
+  const validationIds = stages.map((stage) => stage.validation?.id ?? null);
+  return (
+    authorization.commitSha === candidate.commit_sha &&
+    authorization.artifactDigest === candidate.artifact_digest &&
+    authorization.policyVersion === candidate.policy_version &&
+    stages.length === STAGES.length &&
+    stages.every(
+      (stage) =>
+        stage.gate_status === "passed" &&
+        stage.validation?.outcome === "passed" &&
+        stage.validation.evidenceRevision === stage.evidence_revision &&
+        stage.validation.policyVersion === candidate.policy_version &&
+        stage.confirmed_evidence_revision === stage.evidence_revision &&
+        stage.approver_id &&
+        stage.approved_at,
+    ) &&
+    Array.isArray(authorization.validationIds) &&
+    authorization.validationIds.length === validationIds.length &&
+    authorization.validationIds.every((id, index) => id && id === validationIds[index])
+  );
+}
+
 export function calculateProgress(stages) {
   if (!stages.length) return 0;
   const completion = stages.reduce((total, stage) => {

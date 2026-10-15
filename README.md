@@ -33,6 +33,8 @@ Check service readiness at <http://127.0.0.1:4173/api/health>.
 
 Every stage is persisted server-side. Evidence changes invalidate downstream review state. A stage requires the current evidence to be cleanly scanned, checklist review, confirmation, passing policy validation, and a separate authorized approval. Release authorization additionally requires all six gates, a pinned commit, and a pinned SHA-256 artifact digest. The UI never deploys; GitHub release tagging is a distinct, separately permissioned operation. Signed webhook deliveries are deduplicated transactionally, and evidence-file deletion failures are queued for retry rather than silently orphaned.
 
+Candidate, evidence, document, artifact, audit, and event access is scoped to project membership. Project roles are independently assigned; administrators manage them from **Project access** in the workspace or through the project membership API. A user with no project membership sees no candidate data. Release authorizations are rejected for tagging when any bound validation, evidence revision, confirmation, approval, policy, commit, or artifact digest is no longer current.
+
 ## Service architecture
 
 ```text
@@ -65,6 +67,7 @@ See [`.env.example`](./.env.example) for supported variables:
 - `GOVERNANCE_DATA_DIR`, `GOVERNANCE_DATABASE_PATH`, `GOVERNANCE_EVIDENCE_DIR`: persistence locations.
 
 Review [the API contract](./docs/api-contract.md) and [the candidate-state response schema](./schemas/governance-state.schema.json) for implemented interfaces and workflow semantics.
+See the [enterprise hardening roadmap](./docs/enterprise-hardening-roadmap.md) for the remaining identity, policy lifecycle, workflow durability, deployment enforcement, evidence, audit, and operational work.
 
 ## Repository layout
 

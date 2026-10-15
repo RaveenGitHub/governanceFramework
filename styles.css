@@ -5199,6 +5199,113 @@ a {
   }
 }
 
+.project-member-list {
+  margin-top: 12px;
+}
+
+.project-member-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) 150px auto auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 64px;
+  border-bottom: 1px solid #eef0f4;
+}
+
+.project-member-row:last-child {
+  border-bottom: 0;
+}
+
+.project-member-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.project-member-copy strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.project-member-copy small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.project-role-control select,
+#project-member-form select,
+#project-account-form input,
+#project-account-form select {
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid #dce2ec;
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+  font-size: 10px;
+  text-transform: capitalize;
+}
+
+.project-member-add-panel {
+  margin-top: 15px;
+  padding: 18px;
+}
+
+.project-member-add-panel h2 {
+  margin: 6px 0 15px;
+  font-size: 15px;
+}
+
+#project-member-form,
+#project-account-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+}
+
+#project-member-form label,
+#project-account-form label {
+  display: grid;
+  min-width: 180px;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+#project-member-form select,
+#project-account-form input,
+#project-account-form select {
+  min-width: 220px;
+}
+
+.danger-button {
+  color: var(--red);
+}
+
+@media (max-width: 700px) {
+  .project-member-row {
+    grid-template-columns: minmax(120px, 1fr) 130px;
+    padding: 10px 0;
+  }
+
+  .project-member-row .button {
+    justify-self: stretch;
+  }
+
+  #project-member-form,
+  #project-member-form label,
+  #project-member-form select,
+  #project-account-form,
+  #project-account-form label,
+  #project-account-form input,
+  #project-account-form select {
+    width: 100%;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

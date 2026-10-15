@@ -12,18 +12,27 @@ import {
   createSession,
   deleteSession,
   getCandidate,
+  getCandidateProjectId,
   getEvidence,
+  getProjectMembership,
   getSession,
   getUserById,
   getUserByUsername,
+  activeUserExists,
+  artifactExistsForPullRequest,
   insertWebhookDelivery,
   insertUser,
   listAudit,
   listCandidates,
+  listProjectMembers,
+  listProjectsForUser,
   listUsers,
   markOutboxDispatched,
   pendingEvents,
+  projectExists,
+  removeProjectMembership,
   sessionCount,
+  setProjectMembership,
   setUserActive,
   updateUserRole,
   withTransaction,
@@ -165,7 +174,9 @@ function actorFor(session) {
     id: session.id,
     username: session.username,
     displayName: session.display_name,
-    role: session.role,
+    get role() {
+      return session.projectRole || session.role;
+    },
   };
 }
 
@@ -190,12 +201,41 @@ function assertCsrf(request, session) {
 }
 
 function requireRoles(session, roles) {
-  assert(roles.includes(session.role), 403, "role_forbidden", "Your governance role is not authorized for this action.", {
+  const role = session.projectRole || session.role;
+  assert(roles.includes(role), 403, "role_forbidden", "Your governance role is not authorized for this action.", {
     requiredRoles: roles,
   });
 }
 
+function requireProjectAccess(session, candidateId) {
+  const projectId = getCandidateProjectId(candidateId);
+  assert(projectId, 404, "candidate_not_found", "The requested release candidate was not found.");
+  if (session.role === "admin") {
+    session.projectRole = "admin";
+    return projectId;
+  }
+  const projectRole = getProjectMembership(session.id, projectId);
+  assert(projectRole, 404, "candidate_not_found", "The requested release candidate was not found.");
+  session.projectRole = projectRole;
+  return projectId;
+}
+
+function revokeProjectEventStreams(userId, projectId) {
+  for (const client of sseClients) {
+    if (
+      client.userId === userId &&
+      client.candidateId &&
+      getCandidateProjectId(client.candidateId) === projectId
+    ) {
+      clearInterval(client.heartbeat);
+      client.response.end();
+      sseClients.delete(client);
+    }
+  }
+}
+
 function requireRevision(request, session, candidateId) {
+  requireProjectAccess(session, candidateId);
   const candidate = getCandidate(candidateId);
   assert(candidate, 404, "candidate_not_found", "The requested release candidate was not found.");
   const candidateRevision = request.headers["if-match"];
@@ -648,23 +688,124 @@ async function handleApi(request, response, url, rawBodyPromise) {
     const role = requireString(body.role, "role", 32);
     assert(/^[A-Za-z0-9._@+-]{3,128}$/.test(username), 400, "invalid_username", "The username contains invalid characters.");
     assert(isAllowedRole(role), 400, "invalid_role", "Choose an allowed governance role.");
+    const projectId = body.projectId;
+    const projectRole = body.projectRole;
+    assert(
+      (projectId === undefined && projectRole === undefined) ||
+        (typeof projectId === "string" && isAllowedRole(projectRole)),
+      400,
+      "invalid_project_membership",
+      "Provide both a valid project ID and project role, or neither.",
+    );
+    if (projectId !== undefined) {
+      assert(projectExists(projectId), 404, "project_not_found", "The requested project was not found.");
+    }
     const passwordHash = await hashPassword(body.password);
     let user;
+    let membership = null;
     try {
-      user = insertUser({ username, displayName, passwordHash, role });
+      withTransaction(() => {
+        user = insertUser({ username, displayName, passwordHash, role });
+        if (projectId !== undefined) {
+          membership = setProjectMembership({ projectId, userId: user.id, role: projectRole });
+        }
+        appendEvent({
+          actor,
+          action: "Created governance user",
+          detail: `${username} · ${role}`,
+          type: "security",
+        });
+        if (projectId !== undefined) {
+          appendEvent({
+            actor,
+            action: "Added new user to project",
+            detail: `${projectId} · ${user.id} · ${membership}`,
+            type: "security",
+          });
+        }
+      });
     } catch (error) {
       if (error.code === "ERR_SQLITE_CONSTRAINT_UNIQUE") {
         throw new HttpError(409, "username_exists", "The username is already in use.");
       }
       throw error;
     }
-    appendEvent({
-      actor,
-      action: "Created governance user",
-      detail: `${username} · ${role}`,
-      type: "security",
+    sendJson(request, response, 201, {
+      user: publicUser(user),
+      ...(projectId !== undefined ? { projectMembership: { projectId, role: membership } } : {}),
     });
-    sendJson(request, response, 201, { user: publicUser(user) });
+    return true;
+  }
+
+  if (pathname === "/api/projects" && method === "GET") {
+    sendJson(request, response, 200, {
+      projects: listProjectsForUser(session.id, session.role === "admin"),
+    });
+    return true;
+  }
+
+  if (parts[1] === "projects" && parts[2] && parts[3] === "members" && method === "GET") {
+    requireRoles(session, ["admin"]);
+    assert(projectExists(parts[2]), 404, "project_not_found", "The requested project was not found.");
+    sendJson(request, response, 200, { members: listProjectMembers(parts[2]) });
+    return true;
+  }
+
+  if (
+    parts[1] === "projects" &&
+    parts[2] &&
+    parts[3] === "members" &&
+    parts[4] &&
+    method === "PUT"
+  ) {
+    requireRoles(session, ["admin"]);
+    assertCsrf(request, session);
+    const projectId = parts[2];
+    const userId = parts[4];
+    assert(projectExists(projectId), 404, "project_not_found", "The requested project was not found.");
+    assert(/^[a-f0-9-]{36}$/i.test(userId) && activeUserExists(userId), 404, "user_not_found", "The active user was not found.");
+    const body = await readJson(request, rawBodyPromise);
+    assert(isAllowedRole(body.role), 400, "invalid_role", "Choose an allowed project role.");
+    let role;
+    withTransaction(() => {
+      const previousRole = getProjectMembership(userId, projectId);
+      role = setProjectMembership({ projectId, userId, role: body.role });
+      appendEvent({
+        actor,
+        action: previousRole ? "Updated project membership" : "Added project member",
+        detail: `${projectId} · ${userId} · ${previousRole || "none"} → ${role}`,
+        type: "security",
+      });
+    });
+    sendJson(request, response, 200, { projectId, userId, role });
+    return true;
+  }
+
+  if (
+    parts[1] === "projects" &&
+    parts[2] &&
+    parts[3] === "members" &&
+    parts[4] &&
+    method === "DELETE"
+  ) {
+    requireRoles(session, ["admin"]);
+    assertCsrf(request, session);
+    const projectId = parts[2];
+    const userId = parts[4];
+    assert(projectExists(projectId), 404, "project_not_found", "The requested project was not found.");
+    let removed = false;
+    withTransaction(() => {
+      removed = removeProjectMembership(projectId, userId);
+      assert(removed, 404, "project_membership_not_found", "The user is not a member of this project.");
+      appendEvent({
+        actor,
+        action: "Removed project member",
+        detail: `${projectId} · ${userId}`,
+        type: "security",
+      });
+    });
+    revokeProjectEventStreams(userId, projectId);
+    sendEmpty(request, response, 204);
     return true;
   }
 
@@ -713,7 +854,9 @@ async function handleApi(request, response, url, rawBodyPromise) {
   }
 
   if (pathname === "/api/candidates" && method === "GET") {
-    sendJson(request, response, 200, { candidates: listCandidates() });
+    sendJson(request, response, 200, {
+      candidates: listCandidates({ userId: session.id, isAdmin: session.role === "admin" }),
+    });
     return true;
   }
 
@@ -732,7 +875,9 @@ async function handleApi(request, response, url, rawBodyPromise) {
   }
 
   if (parts[1] === "candidates" && parts[2] && parts[3] === "state" && method === "GET") {
+    requireProjectAccess(session, parts[2]);
     const candidate = publicCandidate(parts[2]);
+    candidate.candidate.projectRole = session.projectRole;
     sendJson(request, response, 200, candidate, { ETag: `"${candidate.candidate.revision}"` });
     return true;
   }
@@ -753,7 +898,13 @@ async function handleApi(request, response, url, rawBodyPromise) {
 
   if (pathname === "/api/events" && method === "GET") {
     const candidateId = url.searchParams.get("candidateId") || null;
-    if (candidateId) publicCandidate(candidateId);
+    assert(
+      candidateId || session.role === "admin",
+      400,
+      "candidate_scope_required",
+      "A candidateId is required for project-scoped event streams.",
+    );
+    if (candidateId) requireProjectAccess(session, candidateId);
     assert(sseClients.size < sseCandidateLimit, 503, "event_stream_capacity", "The live event stream is at capacity; retry shortly.");
     const cursor = parseEventId(request.headers["last-event-id"] || url.searchParams.get("after"));
     response.writeHead(200, {
@@ -774,7 +925,13 @@ async function handleApi(request, response, url, rawBodyPromise) {
     const client = { response, candidateId, userId: actor.id };
     sseClients.add(client);
     const heartbeat = setInterval(() => {
-      if (!resolveOptionalSession(request)) {
+      const activeSession = resolveOptionalSession(request);
+      if (
+        !activeSession ||
+        (candidateId &&
+          activeSession.role !== "admin" &&
+          !getProjectMembership(activeSession.id, getCandidateProjectId(candidateId)))
+      ) {
         response.end();
         sseClients.delete(client);
         clearInterval(heartbeat);
@@ -791,6 +948,7 @@ async function handleApi(request, response, url, rawBodyPromise) {
       }
       if (nextEvents.length === 0) response.write(`: heartbeat ${Date.now()}\n\n`);
     }, 15_000);
+    client.heartbeat = heartbeat;
     response.on("close", () => {
       clearInterval(heartbeat);
       sseClients.delete(client);
@@ -827,6 +985,7 @@ async function handleApi(request, response, url, rawBodyPromise) {
   if (pathname === "/api/evidence/list" && method === "GET") {
     const candidateId = requireString(url.searchParams.get("candidateId"), "candidateId", 64);
     const stageId = requireString(url.searchParams.get("stageId"), "stageId", 32);
+    requireProjectAccess(session, candidateId);
     sendJson(request, response, 200, {
       evidence: evidenceForStage(candidateId, stageId),
       scanner: { available: scannerAvailable(), required: true },
@@ -837,6 +996,7 @@ async function handleApi(request, response, url, rawBodyPromise) {
   if (parts[1] === "evidence" && parts.length === 3 && parts[2] !== "upload" && parts[2] !== "list" && method === "GET") {
     const evidence = getEvidence(parts[2]);
     assert(evidence, 404, "evidence_not_found", "The requested evidence does not exist.");
+    requireProjectAccess(session, evidence.candidateId);
     assert(evidence.scanStatus === "clean", 423, "evidence_quarantined", "Evidence is quarantined and cannot be opened until malware scanning marks it clean.");
     const internal = evidenceDetails(evidence.id);
     const data = await loadEvidenceFile(internal);
@@ -988,7 +1148,9 @@ async function handleApi(request, response, url, rawBodyPromise) {
   }
 
   if (parts[1] === "documents" && parts[2] && method === "GET") {
-    const document = readStageDocument(url.searchParams.get("candidateId"), parts[2]);
+    const candidateId = requireString(url.searchParams.get("candidateId"), "candidateId", 64);
+    requireProjectAccess(session, candidateId);
+    const document = readStageDocument(candidateId, parts[2]);
     response.writeHead(200, responseHeaders(request, {
       contentType: document.format === "html" ? "text/html; charset=utf-8" : "text/markdown; charset=utf-8",
       contentLength: Buffer.byteLength(document.content),
@@ -1000,6 +1162,7 @@ async function handleApi(request, response, url, rawBodyPromise) {
 
   if (parts[1] === "release" && parts[2] === "confidence" && method === "GET") {
     const candidateId = url.searchParams.get("candidateId");
+    requireProjectAccess(session, candidateId);
     sendJson(request, response, 200, releaseConfidence(candidateId));
     return true;
   }
@@ -1150,9 +1313,18 @@ async function handleApi(request, response, url, rawBodyPromise) {
   }
 
   if (pathname === "/api/repo/pull-request-comment" && method === "POST") {
-    requireRoles(session, ["admin", "qa_lead"]);
     assertCsrf(request, session);
     const body = await readJson(request, rawBodyPromise);
+    requireRevision(request, session, body.candidateId);
+    requireRoles(session, ["admin", "qa_lead"]);
+    assert(
+      Number.isSafeInteger(body.number) &&
+        body.number > 0 &&
+        artifactExistsForPullRequest(body.candidateId, body.number),
+      404,
+      "pull_request_not_found",
+      "The pull request is not associated with an artifact in this candidate.",
+    );
     const comment = await commentOnPullRequest(body.number, body.body);
     sendJson(request, response, 201, { id: comment.id, htmlUrl: comment.html_url });
     return true;
@@ -1164,6 +1336,13 @@ async function handleApi(request, response, url, rawBodyPromise) {
     const after = parseEventId(url.searchParams.get("after"));
     const type = url.searchParams.get("type") || undefined;
     const candidateId = url.searchParams.get("candidateId") || undefined;
+    assert(
+      candidateId || session.role === "admin",
+      400,
+      "candidate_scope_required",
+      "A candidateId is required for project-scoped audit queries.",
+    );
+    if (candidateId) requireProjectAccess(session, candidateId);
     const logs = auditRecords({ candidateId, actor, after, limit: rawLimit, type });
     sendJson(request, response, 200, {
       events: logs,
