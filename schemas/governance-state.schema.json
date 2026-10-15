@@ -1,0 +1,318 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/governance-state.schema.json",
+  "title": "Governance Candidate State Response",
+  "description": "Authenticated GET /api/candidates/{candidateId}/state response.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "candidate",
+    "stages",
+    "overallProgress",
+    "releaseConfidence",
+    "defectEscapeRate",
+    "securityVulnerabilityCount",
+    "regressionRisk",
+    "productionReadiness",
+    "releaseAuthorization",
+    "evidence",
+    "documents",
+    "artifacts",
+    "auditEvents"
+  ],
+  "properties": {
+    "candidate": {
+      "$ref": "#/$defs/candidate"
+    },
+    "stages": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "$ref": "#/$defs/stage"
+      }
+    },
+    "overallProgress": {
+      "$ref": "#/$defs/score"
+    },
+    "releaseConfidence": {
+      "type": "object",
+      "required": ["score", "status", "releaseEligible", "passedStages", "totalStages"],
+      "properties": {
+        "score": {
+          "$ref": "#/$defs/nullableScore"
+        },
+        "status": {
+          "enum": ["unavailable", "provisional", "final", "stale"]
+        },
+        "releaseEligible": {
+          "type": "boolean"
+        },
+        "passedStages": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "totalStages": {
+          "const": 6
+        },
+        "explanation": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "defectEscapeRate": {
+      "$ref": "#/$defs/nullableScore"
+    },
+    "securityVulnerabilityCount": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "regressionRisk": {
+      "$ref": "#/$defs/nullableScore"
+    },
+    "productionReadiness": {
+      "$ref": "#/$defs/score"
+    },
+    "releaseAuthorization": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": ["authorized", "authorizedAt", "commitSha", "artifactDigest", "policyVersion"],
+          "properties": {
+            "authorized": {
+              "type": "boolean"
+            },
+            "authorizedAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "commitSha": {
+              "type": "string"
+            },
+            "artifactDigest": {
+              "type": "string"
+            },
+            "policyVersion": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "stageId", "name", "scanStatus", "sizeBytes", "sha256"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "stageId": {
+            "$ref": "#/$defs/stageId"
+          },
+          "name": {
+            "type": "string"
+          },
+          "scanStatus": {
+            "enum": ["pending", "clean", "infected", "unscanned", "scan_error"]
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "documents": {
+      "$ref": "#/$defs/objectArray"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/objectArray"
+    },
+    "auditEvents": {
+      "$ref": "#/$defs/objectArray"
+    }
+  },
+  "$defs": {
+    "score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "nullableScore": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/score"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "stageId": {
+      "enum": [
+        "requirements",
+        "architecture",
+        "code",
+        "tests",
+        "cicd",
+        "production"
+      ]
+    },
+    "candidate": {
+      "type": "object",
+      "required": [
+        "id",
+        "projectId",
+        "projectName",
+        "releaseName",
+        "commitSha",
+        "artifactDigest",
+        "policyVersion",
+        "revision",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "projectName": {
+          "type": "string"
+        },
+        "releaseName": {
+          "type": "string"
+        },
+        "commitSha": {
+          "type": "string"
+        },
+        "artifactDigest": {
+          "type": "string"
+        },
+        "policyVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "targetDate": {
+          "type": ["string", "null"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "stage": {
+      "type": "object",
+      "required": [
+        "id",
+        "position",
+        "name",
+        "shortName",
+        "workStatus",
+        "gateStatus",
+        "evidenceRequirements",
+        "checklist",
+        "metrics",
+        "findings",
+        "evidenceRevision",
+        "evidenceFiles",
+        "completion"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stageId"
+        },
+        "position": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "name": {
+          "type": "string"
+        },
+        "shortName": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "workStatus": {
+          "enum": ["not_started", "in_progress", "ready_for_review", "confirmed"]
+        },
+        "gateStatus": {
+          "enum": ["locked", "not_run", "running", "awaiting_approval", "passed", "failed", "error", "stale"]
+        },
+        "evidenceRequirements": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "checklist": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "boolean"
+          }
+        },
+        "metrics": {
+          "type": "object"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "analysis": {
+          "type": ["object", "null"]
+        },
+        "evidenceRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidenceFiles": {
+          "$ref": "#/$defs/objectArray"
+        },
+        "completion": {
+          "$ref": "#/$defs/score"
+        }
+      },
+      "additionalProperties": true
+    },
+    "objectArray": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  }
+}
