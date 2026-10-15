@@ -8,6 +8,7 @@ import {
   evaluateStage,
   formatMetric,
 } from "../src/governance.js";
+import { validateProposal } from "../src/server/github.mjs";
 
 const candidateSchema = JSON.parse(
   readFileSync(
@@ -38,6 +39,42 @@ test("the API schema requires exactly the six governed stages", () => {
   assert.deepEqual(
     candidateSchema.$defs.stageId.enum,
     STAGES.map(({ id }) => id),
+  );
+});
+
+test("repository proposals reject traversal, secrets, workflow changes, and duplicate paths", () => {
+  assert.deepEqual(
+    validateProposal([{ path: "src/tests/report.test.js", content: "export const ready = true;\n" }]),
+    [{ path: "src/tests/report.test.js", content: "export const ready = true;\n" }],
+  );
+  for (const filePath of ["../outside.txt", "/absolute.txt"]) {
+    assert.throws(
+      () => validateProposal([{ path: filePath, content: "unsafe" }]),
+      { code: "invalid_proposal_path" },
+      `${filePath} should not be allowed`,
+    );
+  }
+  for (const filePath of [".env", "config/secrets.yaml"]) {
+    assert.throws(
+      () => validateProposal([{ path: filePath, content: "unsafe" }]),
+      { code: "sensitive_artifact_path" },
+      `${filePath} should not be allowed`,
+    );
+  }
+  assert.throws(
+    () => validateProposal([{ path: ".github/workflows/release.yml", content: "unsafe" }]),
+    { code: "restricted_artifact_path" },
+  );
+  assert.throws(
+    () => validateProposal([
+      { path: "src/a.js", content: "one" },
+      { path: "src/a.js", content: "two" },
+    ]),
+    { code: "duplicate_artifact_path" },
+  );
+  assert.throws(
+    () => validateProposal([{ path: "src/a.js", content: "contains\0null" }]),
+    { code: "invalid_proposal_file" },
   );
 });
 

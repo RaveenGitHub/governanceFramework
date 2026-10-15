@@ -170,6 +170,20 @@ db.exec(`
     dispatched_at TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    provider TEXT NOT NULL CHECK (provider IN ('github', 'ci')),
+    delivery_id TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (provider, delivery_id)
+  ) WITHOUT ROWID;
+
+  CREATE TABLE IF NOT EXISTS evidence_cleanup (
+    evidence_id TEXT PRIMARY KEY,
+    storage_name TEXT NOT NULL UNIQUE,
+    queued_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS release_authorizations (
     id TEXT PRIMARY KEY,
     candidate_id TEXT NOT NULL REFERENCES candidates(id),
@@ -516,6 +530,42 @@ export function updateEvidenceScan(id, scanStatus, scanDetail) {
     id,
   );
   return getEvidence(id);
+}
+
+export function insertWebhookDelivery({ provider, deliveryId, payloadSha256 }) {
+  try {
+    db.prepare(
+      `INSERT INTO webhook_deliveries (provider, delivery_id, payload_sha256, received_at)
+       VALUES (?, ?, ?, ?)`,
+    ).run(provider, deliveryId, payloadSha256, now());
+    return true;
+  } catch (error) {
+    if (error.errcode === 1555 || error.errcode === 2067) {
+      const existing = db.prepare(
+        "SELECT payload_sha256 FROM webhook_deliveries WHERE provider = ? AND delivery_id = ?",
+      ).get(provider, deliveryId);
+      if (existing?.payload_sha256 === payloadSha256) return false;
+      throw new HttpError(409, "webhook_delivery_conflict", "A delivery identifier cannot be reused for a different signed webhook payload.");
+    }
+    throw error;
+  }
+}
+
+export function queueEvidenceCleanup(evidenceId, storageName) {
+  db.prepare(
+    `INSERT OR IGNORE INTO evidence_cleanup (evidence_id, storage_name, queued_at)
+     VALUES (?, ?, ?)`,
+  ).run(evidenceId, storageName, now());
+}
+
+export function listEvidenceCleanup() {
+  return db
+    .prepare("SELECT evidence_id AS evidenceId, storage_name AS storageName FROM evidence_cleanup ORDER BY queued_at")
+    .all();
+}
+
+export function completeEvidenceCleanup(evidenceId) {
+  db.prepare("DELETE FROM evidence_cleanup WHERE evidence_id = ?").run(evidenceId);
 }
 
 export function insertValidation({ id = randomUUID(), candidateId, stageId, evidenceRevision, policyVersion, outcome, checks, actorId }) {

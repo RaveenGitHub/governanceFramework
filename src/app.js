@@ -924,7 +924,7 @@ function renderArtifactPage() {
       <section class="repo-connect-banner"><div class="repo-icon">${icon("code", 23)}</div><div><div class="section-kicker">CONFIGURED REPOSITORY</div><h2>${escapeHTML(state.capabilities?.github?.repository || "Repository integration not configured")}</h2><p>Candidate commit <code>${escapeHTML(state.candidate?.commitSha || "Not pinned")}</code> <span>·</span> ${state.capabilities?.github?.configured ? "GitHub API configured" : "Set GITHUB_TOKEN, GITHUB_OWNER, and GITHUB_REPO to enable provider actions"}</p></div><span class="repo-connection-status ${state.capabilities?.github?.configured ? "repo-connected" : "repo-demo-status"}"><i></i>${state.capabilities?.github?.configured ? "Configured" : "Unavailable"}</span></section>
       <div class="artifact-policy-note">${icon("shield", 16)} Generated artifacts are proposals — changes require a human-reviewed pull request. Protected branches are never modified directly.</div>
       <div class="section-heading-row"><div><div class="section-kicker">PROPOSED CHANGES</div><h2>Artifact workspace <span class="heading-count">${state.artifacts.length}</span></h2></div><button class="button button-outline button-small" data-action="navigate" data-view="audit">View activity ${icon("arrowRight", 14)}</button></div>
-      <section class="artifact-list">${state.artifacts.map((artifact) => `<article class="artifact-card"><div class="artifact-card-top"><span class="artifact-file-icon">${icon("code", 18)}</span><span class="artifact-status status-${escapeHTML(artifact.status.toLowerCase().replaceAll(" ", "-"))}">${escapeHTML(artifact.status.replaceAll("_", " "))}</span></div><h3>${escapeHTML(artifact.title)}</h3><p>Proposed from finding <strong>${escapeHTML(artifact.source)}</strong></p><div class="artifact-file-list">${artifact.files.map((file) => `<span>${icon("file", 14)} ${escapeHTML(file)}</span>`).join("")}</div><div class="artifact-card-footer"><span>${icon("clock", 14)} Updated ${escapeHTML(artifact.updatedAt)}</span><button class="button button-outline button-small" data-action="preview-artifact" data-artifact="${escapeHTML(artifact.id)}">Review diff ${icon("arrowRight", 14)}</button></div></article>`).join("") || '<div class="small-empty-state">No code artifact proposals have been saved to this candidate.</div>'}</section>
+      <section class="artifact-list">${state.artifacts.map((artifact) => `<article class="artifact-card"><div class="artifact-card-top"><span class="artifact-file-icon">${icon("code", 18)}</span><span class="artifact-status status-${escapeHTML(artifact.status.toLowerCase().replaceAll("_", "-").replaceAll(" ", "-"))}">${escapeHTML(artifact.status.replaceAll("_", " "))}</span></div><h3>${escapeHTML(artifact.title)}</h3><p>Proposed from finding <strong>${escapeHTML(artifact.source)}</strong>${artifact.status === "stale_candidate" ? " · Candidate identity changed; review this pull request against the current release before proceeding." : ""}</p><div class="artifact-file-list">${artifact.files.map((file) => `<span>${icon("file", 14)} ${escapeHTML(file)}</span>`).join("")}</div><div class="artifact-card-footer"><span>${icon("clock", 14)} Updated ${escapeHTML(artifact.updatedAt)}</span><button class="button button-outline button-small" data-action="preview-artifact" data-artifact="${escapeHTML(artifact.id)}">Review diff ${icon("arrowRight", 14)}</button></div></article>`).join("") || '<div class="small-empty-state">No code artifact proposals have been saved to this candidate.</div>'}</section>
       <div class="artifact-disclaimer">${icon("sparkles", 15)} Generated code is not verified until it passes repository checks, required human reviews, and tests.</div>
     </main>`;
 }
@@ -1014,7 +1014,8 @@ function renderModal() {
     const artifact = state.artifacts.find((item) => item.id === state.currentModal.id);
     if (!artifact) return "";
     const files = artifact.files_json ? JSON.parse(artifact.files_json) : artifact.files.map((file) => ({ path: file, content: "" }));
-    return `<div class="modal-backdrop" data-action="dismiss-modal"><section class="modal artifact-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><header class="modal-header"><div><div class="section-kicker">PROPOSED CODE CHANGE · REVIEW REQUIRED</div><h2 id="modal-title">${escapeHTML(artifact.title)}</h2></div><button class="icon-button" data-action="close-modal" aria-label="Close preview">${icon("close", 18)}</button></header><div class="artifact-review-meta"><span>${icon("code", 15)} ${escapeHTML(state.capabilities?.github?.repository || "Repository integration not configured")}</span><span>Base commit <code>${escapeHTML(state.candidate?.commitSha || "Not pinned")}</code></span><span>Source finding <strong>${escapeHTML(artifact.source)}</strong></span></div>${files.map((file) => `<div class="diff-view"><div class="diff-file-header">${icon("file", 15)} ${escapeHTML(file.path)}<span>Proposed addition · Human review required</span></div><pre>${escapeHTML(file.content)}</pre></div>`).join("")}<div class="artifact-review-warning">${icon("alert", 15)} Proposed code is unverified until reviewed, submitted through a pull request, and tested in your repository.</div><footer class="modal-footer"><span class="modal-footer-note">Protected branches are never modified directly.</span><button class="button button-outline button-small" data-action="close-modal">Close</button><button class="button button-primary button-small" data-action="create-pr" data-artifact="${escapeHTML(artifact.id)}">${icon("external", 15)} Create review pull request</button></footer></section></div>`;
+    const canSubmit = ["draft", "failed"].includes(artifact.status);
+    return `<div class="modal-backdrop" data-action="dismiss-modal"><section class="modal artifact-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><header class="modal-header"><div><div class="section-kicker">PROPOSED CODE CHANGE · REVIEW REQUIRED</div><h2 id="modal-title">${escapeHTML(artifact.title)}</h2></div><button class="icon-button" data-action="close-modal" aria-label="Close preview">${icon("close", 18)}</button></header><div class="artifact-review-meta"><span>${icon("code", 15)} ${escapeHTML(state.capabilities?.github?.repository || "Repository integration not configured")}</span><span>Base commit <code>${escapeHTML(state.candidate?.commitSha || "Not pinned")}</code></span><span>Source finding <strong>${escapeHTML(artifact.source)}</strong></span></div>${files.map((file) => `<div class="diff-view"><div class="diff-file-header">${icon("file", 15)} ${escapeHTML(file.path)}<span>Proposed addition · Human review required</span></div><pre>${escapeHTML(file.content)}</pre></div>`).join("")}<div class="artifact-review-warning">${icon("alert", 15)} Proposed code is unverified until reviewed, submitted through a pull request, and tested in your repository.</div><footer class="modal-footer"><span class="modal-footer-note">${canSubmit ? "Protected branches are never modified directly." : artifact.status === "stale_candidate" ? `Pull request ${escapeHTML(artifact.pullRequestUrl || "created")} targets a prior candidate identity.` : `Repository proposal status: ${escapeHTML(artifact.status.replaceAll("_", " "))}.`}</span><button class="button button-outline button-small" data-action="close-modal">Close</button>${canSubmit ? `<button class="button button-primary button-small" data-action="create-pr" data-artifact="${escapeHTML(artifact.id)}">${icon("external", 15)} ${artifact.status === "failed" ? "Retry pull request" : "Create review pull request"}</button>` : ""}</footer></section></div>`;
   }
   if (state.currentModal.type === "new-artifact") {
     const findings = state.stages.flatMap((stage) => stage.findings.map((finding) => ({ ...finding, stageId: stage.id })));
@@ -1118,12 +1119,21 @@ async function runStageAnalysis(stageId) {
 
 async function runValidation(stageId) {
   try {
-    await apiRequest(`/api/candidates/${encodeURIComponent(state.candidateId)}/stages/${encodeURIComponent(stageId)}/validations`, {
+    const { data } = await apiRequest(`/api/candidates/${encodeURIComponent(state.candidateId)}/stages/${encodeURIComponent(stageId)}/validations`, {
       method: "POST",
       body: {},
     });
     await loadCandidate();
     const result = stageState(stageId).validation?.outcome;
+    const sync = data.integrations?.githubCommitStatus;
+    if (data.integrations?.candidateChangedDuringSync) {
+      showToast("The candidate changed while validation status was synchronizing. The workspace has been reloaded; review the current stage before proceeding.", "error");
+      return;
+    }
+    if (sync?.status === "failed") {
+      showToast(`Policy validation ${result === "passed" ? "passed" : "failed"}, but GitHub commit status synchronization failed (${sync.errorCode}). Review the audit log.`, "error");
+      return;
+    }
     showToast(result === "passed"
       ? "Validation passed. A different authorized reviewer must approve this gate."
       : "Validation failed. Review the server policy checks before continuing.",
@@ -1240,7 +1250,10 @@ async function createPullRequest(artifactId) {
     });
     state.currentModal = null;
     await loadCandidate();
-    showToast(`Pull request #${data.number} opened for human review.`);
+    showToast(data.staleCandidate
+      ? `Pull request #${data.number} opened against the prior candidate identity. Review it before considering the current release.`
+      : `Pull request #${data.number} opened for human review.`,
+    data.staleCandidate ? "error" : "success");
   } catch (error) {
     reportError(error);
   }
@@ -1293,12 +1306,14 @@ async function addEvidence(files) {
 
 async function removeEvidence(evidenceId) {
   try {
-    await apiRequest(`/api/evidence/${encodeURIComponent(evidenceId)}?candidateId=${encodeURIComponent(state.candidateId)}`, {
+    const { data } = await apiRequest(`/api/evidence/${encodeURIComponent(evidenceId)}?candidateId=${encodeURIComponent(state.candidateId)}`, {
       method: "DELETE",
       body: {},
     });
     await loadCandidate();
-    showToast("Evidence removed from this release candidate.");
+    showToast(data.evidenceCleanupPending
+      ? "Evidence was detached from this candidate, but its private file could not yet be deleted. Cleanup will be retried and is recorded in the server log."
+      : "Evidence removed from this release candidate.");
   } catch (error) {
     reportError(error);
   }

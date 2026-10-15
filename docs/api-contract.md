@@ -48,7 +48,7 @@ Mutating browser requests use the `governance_session` HttpOnly cookie, `X-CSRF-
 | `POST` | `/api/production/readiness` | Production-stage validation alias |
 | `GET` | `/api/release/confidence?candidateId={id}` | Policy-derived confidence, eligibility, and risk |
 | `POST` | `/api/release/authorize` | Record final authorization after all release conditions pass |
-| `POST` | `/api/release/tag` | Admin-only creation of an authorized GitHub release tag |
+| `POST` | `/api/release/tag` | Admin-only creation of an authorized GitHub release tag (candidate ETag required) |
 
 The six stage IDs are `requirements`, `architecture`, `code`, `tests`, `cicd`, and `production`. A gate cannot pass unless prerequisites, required evidence, evidence cleanliness, current confirmation, checklist, validation, and reviewer policy pass. Approval is separate from validation. Release confidence is a deterministic policy index, **not** an AI probability; the optional AI integration only provides advisory analysis.
 
@@ -77,11 +77,15 @@ Uploads are stored privately and quarantined until the configured scanner report
 | `POST` | `/api/repo/push` | Submit a stored artifact as a review pull request (never direct push) |
 | `POST` | `/api/repo/pull-request-comment` | Add a permissioned PR review comment |
 | `POST` | `/api/github/webhook` | Verify configured GitHub HMAC-signed webhook |
-| `POST` | `/api/cicd/coverage` | Verify HMAC-signed CI coverage report and unique delivery identifier |
+| `POST` | `/api/cicd/coverage` | Public webhook endpoint verifying HMAC-signed CI coverage and unique delivery identifier |
 | `GET` | `/api/events?candidateId={id}` | Server-Sent Events stream for governance/audit updates |
 | `GET` | `/api/audit/logs?candidateId={id}&limit={n}&after={cursor}&type={type}` | Cursor-paginated audit records; page size 1–200 |
 
-Webhook senders must sign the exact raw request body with HMAC-SHA256. CI deliveries include the same unique ID in the signed JSON body and `X-CI-Delivery` header. Configure and test webhook source restrictions, secret rotation, replay handling, and delivery retry behavior before exposing the service to an external network.
+Webhook endpoints authenticate using HMAC over the exact raw request body and do not require a browser session. CI deliveries include the same unique ID in the signed JSON body and `X-CI-Delivery` header. Delivery identifiers and payload digests are persisted transactionally with their state updates. An exact retry is acknowledged without applying it again (`202` and `duplicateDelivery: true` for GitHub, `200` and `duplicateDelivery: true` for CI); reuse of an identifier for a different signed payload returns `409`. Configure source restrictions at the TLS-terminating proxy and rotate secrets according to policy before exposing webhook endpoints externally.
+
+When stage policy validation is committed but the optional GitHub commit-status update fails, the validation remains persisted. Its response includes `integrations.githubCommitStatus.status: "failed"` and an audit event; the UI reports that mismatch instead of implying synchronization succeeded. A repository pull request that finishes after the candidate identity changes is recorded as `stale_candidate` with its URL so that the created external resource is not lost or mistaken for a proposal against the current candidate.
+
+Evidence removal deletes its database record and queues the private-file cleanup in one transaction. A failed unlink is reported to the caller, retained in the cleanup queue, and retried periodically and on service startup. Infected rescans use the same tracked cleanup mechanism.
 
 ## Local state and production boundary
 

@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import {
   STAGES,
   calculateProgress,
@@ -10,6 +9,7 @@ import {
   createArtifact,
   createCandidate,
   createDocument,
+  completeEvidenceCleanup,
   db,
   findCandidate,
   findStage,
@@ -18,6 +18,7 @@ import {
   getCandidate,
   getDocument,
   insertEvidence,
+  insertWebhookDelivery,
   insertValidation,
   insertReleaseAuthorization,
   jsonColumn,
@@ -25,7 +26,9 @@ import {
   listArtifacts,
   listAudit,
   listDocuments,
+  listEvidenceCleanup,
   listEvidence,
+  queueEvidenceCleanup,
   updateArtifact,
   updateEvidenceScan,
   updateStage,
@@ -34,12 +37,13 @@ import {
 import { config } from "./config.mjs";
 import { analyzeEvidence } from "./ai.mjs";
 import { assert, HttpError } from "./errors.mjs";
-import { loadEvidenceFile } from "./storage.mjs";
+import { loadEvidenceFile, removeEvidenceFile } from "./storage.mjs";
 import {
   checkCommitStatus,
   createPullRequest,
   createReleaseTag,
   setCommitStatus,
+  validateProposal,
 } from "./github.mjs";
 
 const severities = new Set(["critical", "high", "medium", "low", "info"]);
@@ -294,8 +298,12 @@ export function createNewCandidate({ projectName, releaseName, commitSha, actor 
   return publicCandidate(candidate.id);
 }
 
-export function setCoverageMetrics({ candidateId, commitSha, metrics, signatureActor }) {
+export function setCoverageMetrics({ candidateId, commitSha, metrics, signatureActor, deliveryId, payloadSha256 }) {
   const candidate = assertCandidate(candidateId);
+  assert(typeof commitSha === "string" && /^[a-f0-9]{40}$/i.test(commitSha), 400, "invalid_commit_sha", "A full 40-character Git commit SHA is required.");
+  assert(typeof deliveryId === "string" && /^[A-Za-z0-9-]{16,100}$/.test(deliveryId), 400, "invalid_ci_delivery", "A unique CI delivery identifier is required.");
+  assert(typeof payloadSha256 === "string" && /^[a-f0-9]{64}$/.test(payloadSha256), 400, "invalid_ci_payload_digest", "The signed CI payload digest is invalid.");
+  assert(typeof signatureActor === "string" && signatureActor.length <= 200 && !/[\u0000-\u001f\u007f]/.test(signatureActor), 400, "invalid_ci_workflow", "The CI workflow identifier is invalid.");
   assert(
     candidate.commit_sha &&
       candidate.commit_sha.toLowerCase() === commitSha.toLowerCase(),
@@ -339,7 +347,18 @@ export function setCoverageMetrics({ candidateId, commitSha, metrics, signatureA
     "Create a new candidate before changing coverage evidence for a passed gate.",
   );
   let emitted;
+  let duplicateDelivery = false;
   withTransaction(() => {
+    const latestCandidate = findCandidate(candidateId);
+    assert(
+      latestCandidate.revision === candidate.revision &&
+        latestCandidate.commit_sha.toLowerCase() === commitSha.toLowerCase(),
+      412,
+      "candidate_changed_during_ci_report",
+      "The pinned release candidate changed while the signed CI report was being verified.",
+    );
+    duplicateDelivery = !insertWebhookDelivery({ provider: "ci", deliveryId, payloadSha256 });
+    if (duplicateDelivery) return;
     const updated = findStage(candidateId, "tests");
     invalidateDownstream(candidateId, "tests");
     updateStage(candidateId, "tests", {
@@ -366,9 +385,12 @@ export function setCoverageMetrics({ candidateId, commitSha, metrics, signatureA
       action: "Recorded authenticated CI coverage metrics",
       detail: `${commitSha} · Line ${bounded.lineCoverage}% · Branch ${bounded.branchCoverage}% · Critical paths ${bounded.criticalPathCoverage}%`,
       type: "coverage",
-      payload: { stageId: "tests", commitSha, metrics: bounded, actor: signatureActor },
+      payload: { stageId: "tests", commitSha, metrics: bounded, actor: signatureActor, deliveryId },
     });
   });
+  if (duplicateDelivery) {
+    return { ...publicCandidate(candidateId), duplicateDelivery: true };
+  }
   eventBusPublish(emitted);
   return publicCandidate(candidateId);
 }
@@ -427,6 +449,21 @@ export function changeCandidateIdentity(candidateId, request, { commitSha, artif
 let broadcaster = () => {};
 export function setEventBroadcaster(fn) {
   broadcaster = fn;
+}
+
+export async function flushEvidenceCleanup(evidenceId = null) {
+  const queued = listEvidenceCleanup().filter((item) => !evidenceId || item.evidenceId === evidenceId);
+  const pending = [];
+  for (const item of queued) {
+    try {
+      await removeEvidenceFile(item.storageName);
+      completeEvidenceCleanup(item.evidenceId);
+    } catch (error) {
+      pending.push(item.evidenceId);
+      console.error(`Evidence cleanup remains pending for ${item.evidenceId}.`, error);
+    }
+  }
+  return pending;
 }
 function eventBusPublish(event) {
   broadcaster(event);
@@ -519,6 +556,13 @@ export async function createEvidence({ candidateId, stageId, filename, bytes, ac
   let emitted;
   try {
     withTransaction(() => {
+      const latest = findCandidate(candidateId);
+      assert(
+        latest.revision === candidate.revision,
+        412,
+        "candidate_changed_during_upload",
+        "The candidate changed while evidence was being uploaded and scanned. Reload and retry the upload.",
+      );
       evidence = insertEvidence(data);
       invalidateDownstream(candidateId, stageId);
       const refreshed = findStage(candidateId, stageId);
@@ -536,9 +580,18 @@ export async function createEvidence({ candidateId, stageId, filename, bytes, ac
       });
     });
   } catch (error) {
-    if (error.code === "SQLITE_CONSTRAINT_UNIQUE") {
-      const { rm } = await import("node:fs/promises");
-      await rm(path.join(config.evidenceRoot, data.storageName), { force: true });
+    try {
+      await removeEvidenceFile(data.storageName);
+    } catch (cleanupError) {
+      console.error(`Failed to remove uncommitted evidence file ${data.id}.`, cleanupError);
+      try {
+        withTransaction(() => queueEvidenceCleanup(data.id, data.storageName));
+        await flushEvidenceCleanup(data.id);
+      } catch (queueError) {
+        console.error(`Failed to queue evidence cleanup ${data.id}.`, queueError);
+      }
+    }
+    if (error.errcode === 2067) {
       throw new HttpError(409, "duplicate_evidence", "An identical file is already attached to this stage.");
     }
     throw error;
@@ -559,36 +612,38 @@ export function evidenceDetails(id) {
     .get(id);
 }
 
-export function removeEvidence({ candidateId, evidenceId, request, actor }) {
+export async function removeEvidence({ candidateId, evidenceId, request, actor }) {
   const candidate = commitIfMatch(candidateId, request);
   const evidence = evidenceDetails(evidenceId);
   assert(evidence && evidence.candidate_id === candidateId, 404, "evidence_not_found", "The requested evidence does not belong to this candidate.");
   assert(actor.role === "admin" || actor.role === "qa_lead", 403, "role_forbidden", "Only administrators and QA leads may remove evidence.");
   const stage = assertStage(candidateId, evidence.stage_id);
   assert(isUnlocked(candidateId, stage.position) && stage.gate_status !== "passed", 409, "stage_immutable", "Evidence for locked or passed stages cannot be removed.");
-  return (async () => {
-    const { rm } = await import("node:fs/promises");
-    await rm(path.join(config.evidenceRoot, evidence.storage_name), { force: true });
-    let emitted;
-    withTransaction(() => {
-      db.prepare("DELETE FROM evidence WHERE id = ?").run(evidenceId);
-      invalidateDownstream(candidateId, evidence.stage_id);
-      const updated = findStage(candidateId, evidence.stage_id);
-      updateStage(candidateId, evidence.stage_id, {
-        evidenceRevision: updated.evidence_revision + 1,
-      });
-      emitted = appendEvent({
-        candidateId,
-        actor,
-        action: "Removed stage evidence",
-        detail: evidence.original_name,
-        type: "evidence",
-        payload: { stageId: evidence.stage_id, evidenceId },
-      });
+  let emitted;
+  withTransaction(() => {
+    const latest = findCandidate(candidateId);
+    assert(latest.revision === candidate.revision, 412, "stale_revision", "The candidate changed before evidence removal; reload and retry.");
+    const currentEvidence = evidenceDetails(evidenceId);
+    assert(currentEvidence?.storage_name === evidence.storage_name, 412, "evidence_changed", "The evidence changed before removal; reload and retry.");
+    queueEvidenceCleanup(evidenceId, evidence.storage_name);
+    db.prepare("DELETE FROM evidence WHERE id = ?").run(evidenceId);
+    invalidateDownstream(candidateId, evidence.stage_id);
+    const updated = findStage(candidateId, evidence.stage_id);
+    updateStage(candidateId, evidence.stage_id, {
+      evidenceRevision: updated.evidence_revision + 1,
     });
-    eventBusPublish(emitted);
-    return publicCandidate(candidateId);
-  })();
+    emitted = appendEvent({
+      candidateId,
+      actor,
+      action: "Removed stage evidence",
+      detail: evidence.original_name,
+      type: "evidence",
+      payload: { stageId: evidence.stage_id, evidenceId },
+    });
+  });
+  eventBusPublish(emitted);
+  const pendingEvidenceCleanup = await flushEvidenceCleanup(evidenceId);
+  return { ...publicCandidate(candidateId), evidenceCleanupPending: pendingEvidenceCleanup.length > 0 };
 }
 
 export async function runStageAnalysis({ candidateId, stageId, actor, request, evidenceIds }) {
@@ -623,12 +678,14 @@ export async function runStageAnalysis({ candidateId, stageId, actor, request, e
   });
   let emitted;
   withTransaction(() => {
+    const latestCandidate = findCandidate(candidateId);
     const existingStage = findStage(candidateId, stageId);
     assert(
-      existingStage.evidence_revision === stage.evidence_revision,
+      latestCandidate.revision === candidate.revision &&
+        existingStage.evidence_revision === stage.evidence_revision,
       412,
-      "evidence_changed_during_analysis",
-      "Evidence changed during analysis. Run the analysis again against the current evidence.",
+      "candidate_changed_during_analysis",
+      "The candidate or its evidence changed during analysis. Run the analysis again against the current revision.",
     );
     updateStage(candidateId, stageId, {
       findings: aiResult.findings,
@@ -812,13 +869,15 @@ export async function validateStage({ candidateId, stageId, request, actor }) {
   let validation;
   let emitted;
   withTransaction(() => {
+    const latestCandidate = findCandidate(candidateId);
     const refreshed = findStage(candidateId, stageId);
     assert(
-      refreshed.evidence_revision === stage.evidence_revision &&
+      latestCandidate.revision === candidate.revision &&
+        refreshed.evidence_revision === stage.evidence_revision &&
         refreshed.confirmed_evidence_revision === stage.evidence_revision,
       412,
-      "evidence_changed_during_validation",
-      "Stage evidence changed during validation. Confirm it again and rerun validation.",
+      "candidate_changed_during_validation",
+      "The candidate or its evidence changed during validation. Confirm the current revision and rerun validation.",
     );
     validation = insertValidation({
       candidateId,
@@ -850,6 +909,7 @@ export async function validateStage({ candidateId, stageId, request, actor }) {
   });
   eventBusPublish(emitted);
 
+  let githubCommitStatus = { status: "not_configured" };
   if (candidate.commit_sha && config.github.token) {
     try {
       await setCommitStatus({
@@ -858,11 +918,35 @@ export async function validateStage({ candidateId, stageId, request, actor }) {
         description: `${definition.shortName}: ${checks.filter((check) => check.status === "passed").length}/${checks.length} governance checks passed`,
         stageId,
       });
+      githubCommitStatus = { status: "synced" };
     } catch (error) {
       console.error("GitHub commit status could not be synchronized.", error.message);
+      githubCommitStatus = {
+        status: "failed",
+        errorCode: error.code || "github_status_sync_failed",
+      };
+      let warningEvent;
+      withTransaction(() => {
+        warningEvent = appendEvent({
+          candidateId,
+          actor,
+          action: "GitHub governance status synchronization failed",
+          detail: `${definition.shortName} validation ${validation.id} · ${githubCommitStatus.errorCode}`,
+          type: "integration_error",
+          payload: { stageId, validationId: validation.id, integration: "github_commit_status", errorCode: githubCommitStatus.errorCode },
+        });
+      });
+      eventBusPublish(warningEvent);
     }
   }
-  return publicCandidate(candidateId);
+  const refreshedCandidate = publicCandidate(candidateId);
+  return {
+    ...refreshedCandidate,
+    integrations: {
+      githubCommitStatus,
+      candidateChangedDuringSync: refreshedCandidate.candidate.revision !== candidate.revision,
+    },
+  };
 }
 
 export function approveStage({ candidateId, stageId, request, actor }) {
@@ -985,8 +1069,9 @@ export function authorizeRelease({ candidateId, request, actor }) {
   };
 }
 
-export async function createAuthorizedReleaseTag({ candidateId, tag, message, actor }) {
+export async function createAuthorizedReleaseTag({ candidateId, tag, message, actor, request }) {
   const candidate = assertCandidate(candidateId);
+  verifyRevision(request, candidate);
   assert(actor.role === "admin", 403, "role_forbidden", "Only an administrator may create a release tag.");
   const authorization = getReleaseAuthorization(candidateId);
   assert(authorization, 409, "release_not_authorized", "Record final production authorization before creating a release tag.");
@@ -1005,18 +1090,25 @@ export async function createAuthorizedReleaseTag({ candidateId, tag, message, ac
     message: message || `Governance-authorized release ${candidate.release_name}\nAuthorization ${authorization.id}\nArtifact ${candidate.artifact_digest}`,
   });
   let event;
+  let staleCandidate = false;
   withTransaction(() => {
+    const latest = findCandidate(candidateId);
+    staleCandidate = latest.revision !== candidate.revision ||
+      latest.commit_sha !== candidate.commit_sha ||
+      latest.artifact_digest !== candidate.artifact_digest;
     event = appendEvent({
       candidateId,
       actor,
-      action: "Created authorized GitHub release tag",
-      detail: `${result.tag} · ${result.targetSha}`,
+      action: staleCandidate
+        ? "Created authorized GitHub release tag for an outdated candidate"
+        : "Created authorized GitHub release tag",
+      detail: `${result.tag} · ${result.targetSha}${staleCandidate ? ` · Candidate changed from revision ${candidate.revision}` : ""}`,
       type: "release",
-      payload: result,
+      payload: { ...result, staleCandidate },
     });
   });
   eventBusPublish(event);
-  return result;
+  return { ...result, staleCandidate };
 }
 
 export async function rescanEvidence({ candidateId, evidenceId, request, actor }) {
@@ -1028,12 +1120,19 @@ export async function rescanEvidence({ candidateId, evidenceId, request, actor }
   assert(stage.gate_status !== "passed", 409, "stage_already_passed", "Passed stages are immutable; create a new candidate to reassess evidence.");
   const { rescanEvidenceFile } = await import("./storage.mjs");
   const result = await rescanEvidenceFile(internal);
-  if (result.status === "infected") {
-    const { rm } = await import("node:fs/promises");
-    await rm(path.join(config.evidenceRoot, internal.storage_name), { force: true });
-  }
   let emitted;
   withTransaction(() => {
+    const latestCandidate = findCandidate(candidateId);
+    const latestEvidence = evidenceDetails(evidenceId);
+    assert(
+      latestCandidate.revision === candidate.revision &&
+        latestEvidence?.sha256 === internal.sha256 &&
+        latestEvidence?.scan_status === internal.scan_status,
+      412,
+      "candidate_changed_during_scan",
+      "The candidate or evidence changed during scanning. Reload the candidate before retrying.",
+    );
+    if (result.status === "infected") queueEvidenceCleanup(evidenceId, internal.storage_name);
     updateEvidenceScan(evidenceId, result.status, result.detail);
     invalidateDownstream(candidateId, internal.stage_id);
     const current = findStage(candidateId, internal.stage_id);
@@ -1050,7 +1149,10 @@ export async function rescanEvidence({ candidateId, evidenceId, request, actor }
     });
   });
   eventBusPublish(emitted);
-  return getEvidence(evidenceId);
+  const pendingEvidenceCleanup = result.status === "infected"
+    ? await flushEvidenceCleanup(evidenceId)
+    : [];
+  return { ...getEvidence(evidenceId), cleanupPending: pendingEvidenceCleanup.length > 0 };
 }
 
 export function releaseConfidence(candidateId) {
@@ -1183,7 +1285,9 @@ export function readStageDocument(candidateId, documentId) {
 
 export function generateCodeProposal({ candidateId, stageId, findingId, title, files, actor }) {
   assert(actor.role !== "auditor", 403, "role_forbidden", "Auditors cannot generate code proposals.");
+  assert(typeof title === "string" && title.trim().length >= 4 && title.length <= 200, 400, "invalid_code_proposal_title", "A code proposal title must contain 4 to 200 characters.");
   assert(Array.isArray(files) && files.length > 0 && files.length <= 20, 400, "invalid_code_proposal", "A code proposal must contain between one and twenty files.");
+  const validatedFiles = validateProposal(files);
   const candidate = assertCandidate(candidateId);
   const stage = assertStage(candidateId, stageId);
   const finding = stage.findings.find((item) => item.id === findingId);
@@ -1192,8 +1296,8 @@ export function generateCodeProposal({ candidateId, stageId, findingId, title, f
     candidateId,
     stageId,
     findingId,
-    title: String(title || "").slice(0, 200),
-    files,
+    title: title.trim(),
+    files: validatedFiles,
     actorId: actor.id,
   });
   const event = appendEvent({
@@ -1218,8 +1322,13 @@ export async function pushArtifact({ candidateId, artifactId, request, actor }) 
   const stage = assertStage(candidateId, artifact.stage_id);
   const finding = stage.findings.find((item) => item.id === artifact.finding_id);
   assert(finding, 409, "artifact_finding_stale", "The source finding is no longer available.");
-  const fileTree = JSON.parse(artifact.files_json);
-  assert(fileTree.every((file) => typeof file.content === "string"), 409, "artifact_files_invalid", "The proposed code artifact failed its content validation.");
+  const fileTree = validateProposal(JSON.parse(artifact.files_json));
+  const title = typeof artifact.title === "string" ? artifact.title.trim() : "";
+  assert(title.length >= 4 && title.length <= 200, 409, "artifact_title_invalid", "The stored code proposal title failed validation.");
+  withTransaction(() => {
+    assert(findCandidate(candidateId).revision === candidate.revision, 412, "stale_revision", "The release candidate changed before the pull request was submitted.");
+    updateArtifact(artifactId, "submitting");
+  });
   let pr;
   try {
     pr = await createPullRequest({
@@ -1230,9 +1339,12 @@ export async function pushArtifact({ candidateId, artifactId, request, actor }) 
       artifactId,
     });
   } catch (error) {
+    let failureEvent;
     withTransaction(() => {
-      updateArtifact(artifactId, "failed");
-      appendEvent({
+      if (db.prepare("SELECT status FROM artifacts WHERE id = ?").get(artifactId)?.status === "submitting") {
+        updateArtifact(artifactId, "failed");
+      }
+      failureEvent = appendEvent({
         candidateId,
         actor,
         action: "Repository proposal failed",
@@ -1241,22 +1353,27 @@ export async function pushArtifact({ candidateId, artifactId, request, actor }) 
         payload: { artifactId },
       });
     });
+    eventBusPublish(failureEvent);
     throw error;
   }
   let event;
+  let staleCandidate = false;
   withTransaction(() => {
-    updateArtifact(artifactId, "pull_request_open", pr.htmlUrl);
+    const latestCandidate = findCandidate(candidateId);
+    staleCandidate = latestCandidate.revision !== candidate.revision ||
+      latestCandidate.commit_sha !== candidate.commit_sha;
+    updateArtifact(artifactId, staleCandidate ? "stale_candidate" : "pull_request_open", pr.htmlUrl);
     event = appendEvent({
       candidateId,
       actor,
-      action: "Opened draft pull request",
-      detail: `PR #${pr.number} · ${pr.branch} · ${pr.commitSha}`,
+      action: staleCandidate ? "Opened draft pull request for an outdated candidate" : "Opened draft pull request",
+      detail: `PR #${pr.number} · ${pr.branch} · ${pr.commitSha}${staleCandidate ? ` · Candidate changed from revision ${candidate.revision}` : ""}`,
       type: "artifact",
       payload: { artifactId, pullRequestUrl: pr.htmlUrl },
     });
   });
   eventBusPublish(event);
-  return { artifactId, ...pr };
+  return { artifactId, ...pr, staleCandidate };
 }
 
 export function auditRecords({ candidateId, actor, after, limit, type }) {

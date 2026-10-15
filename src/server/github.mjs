@@ -1,5 +1,5 @@
 import { config, assertConfiguredGitHub } from "./config.mjs";
-import { assert } from "./errors.mjs";
+import { assert, HttpError } from "./errors.mjs";
 
 function apiBase() {
   return `${config.github.apiUrl}/repos/${encodeURIComponent(config.github.owner)}/${encodeURIComponent(config.github.repo)}`;
@@ -104,7 +104,7 @@ export async function setCommitStatus({ sha, outcome, description, stageId, targ
   });
 }
 
-function validateProposal(files) {
+export function validateProposal(files) {
   assert(Array.isArray(files) && files.length > 0 && files.length <= 50, 400, "invalid_proposal_files", "Supply 1 to 50 reviewable artifact files.");
   const names = new Set();
   const tree = files.map((file) => {
@@ -113,6 +113,15 @@ function validateProposal(files) {
       400,
       "invalid_proposal_file",
       "Every artifact file needs a path and UTF-8 content.",
+    );
+    assert(
+      file.path.length > 0 &&
+        file.path.length <= 200 &&
+        file.content.length > 0 &&
+        !file.content.includes("\0"),
+      400,
+      "invalid_proposal_file",
+      "Artifact paths and UTF-8 file contents must be non-empty and within their size limits.",
     );
     const safePath = file.path.replaceAll("\\", "/");
     assert(
@@ -252,9 +261,16 @@ export async function inspectWebhookDelivery(request, rawBody) {
   );
   const received = Buffer.from(signature);
   assert(expected.length === received.length && timingSafeEqual(expected, received), 401, "invalid_webhook_signature", "The GitHub webhook signature is invalid.");
-  return {
-    event: String(request.headers["x-github-event"] || "").slice(0, 100),
-    deliveryId: String(request.headers["x-github-delivery"] || "").slice(0, 100),
-    body: JSON.parse(rawBody.toString("utf8")),
-  };
+  const event = request.headers["x-github-event"];
+  const deliveryId = request.headers["x-github-delivery"];
+  assert(typeof event === "string" && /^[a-z_]{1,100}$/.test(event), 400, "invalid_webhook_event", "A valid GitHub webhook event name is required.");
+  assert(typeof deliveryId === "string" && /^[a-f0-9-]{16,100}$/i.test(deliveryId), 400, "invalid_webhook_delivery", "A valid GitHub delivery identifier is required.");
+  let body;
+  try {
+    body = JSON.parse(rawBody.toString("utf8"));
+  } catch {
+    throw new HttpError(400, "invalid_webhook_json", "The signed GitHub webhook body must contain valid JSON.");
+  }
+  assert(body && typeof body === "object" && !Array.isArray(body), 400, "invalid_webhook_body", "The signed GitHub webhook body must be a JSON object.");
+  return { event, deliveryId, body };
 }

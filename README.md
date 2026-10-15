@@ -31,7 +31,7 @@ Check service readiness at <http://127.0.0.1:4173/api/health>.
 5. CI/CD Quality Gate.
 6. Production Readiness Gate and explicit release authorization.
 
-Every stage is persisted server-side. Evidence changes invalidate downstream review state. A stage requires the current evidence to be cleanly scanned, checklist review, confirmation, passing policy validation, and a separate authorized approval. Release authorization additionally requires all six gates, a pinned commit, and a pinned SHA-256 artifact digest. The UI never deploys; GitHub release tagging is a distinct, separately permissioned operation.
+Every stage is persisted server-side. Evidence changes invalidate downstream review state. A stage requires the current evidence to be cleanly scanned, checklist review, confirmation, passing policy validation, and a separate authorized approval. Release authorization additionally requires all six gates, a pinned commit, and a pinned SHA-256 artifact digest. The UI never deploys; GitHub release tagging is a distinct, separately permissioned operation. Signed webhook deliveries are deduplicated transactionally, and evidence-file deletion failures are queued for retry rather than silently orphaned.
 
 ## Service architecture
 

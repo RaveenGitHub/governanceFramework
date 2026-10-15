@@ -85,6 +85,26 @@ if (!Number.isInteger(config.clamav.port) || config.clamav.port < 1 || config.cl
   throw new Error("CLAMAV_PORT must be a valid TCP port.");
 }
 
+for (const [name, secret] of [
+  ["CI_WEBHOOK_SECRET", config.ciWebhookSecret],
+  ["GITHUB_WEBHOOK_SECRET", config.github.webhookSecret],
+]) {
+  if (secret && Buffer.byteLength(secret) < 32) {
+    throw new Error(`${name} must contain at least 32 bytes.`);
+  }
+}
+
+if (isProduction) {
+  for (const [name, url] of [
+    ["AI_BASE_URL", config.ai.baseUrl],
+    ["GITHUB_API_URL", config.github.apiUrl],
+  ]) {
+    if (new URL(url).protocol !== "https:") {
+      throw new Error(`${name} must use HTTPS in production.`);
+    }
+  }
+}
+
 if ((config.github.owner && !config.github.token) || (config.github.repo && !config.github.token)) {
   throw new Error("GITHUB_TOKEN is required when configuring GITHUB_OWNER or GITHUB_REPO.");
 }

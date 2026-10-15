@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
@@ -12,12 +12,11 @@ import {
   createSession,
   deleteSession,
   getCandidate,
-  getDocument,
   getEvidence,
-  getReleaseAuthorization,
   getSession,
   getUserById,
   getUserByUsername,
+  insertWebhookDelivery,
   insertUser,
   listAudit,
   listCandidates,
@@ -58,6 +57,7 @@ import {
   evidenceDetails,
   evidenceForStage,
   generateCodeProposal,
+  flushEvidenceCleanup,
   publicCandidate,
   pushArtifact,
   readStageDocument,
@@ -76,7 +76,6 @@ import {
   checkCommitStatus,
   commentOnPullRequest,
   githubStatus,
-  setCommitStatus,
 } from "./github.mjs";
 import {
   loadEvidenceFile,
@@ -102,6 +101,7 @@ const contentTypes = new Map([
 const sseClients = new Set();
 const sseCandidateLimit = 100;
 const serverStartedAt = new Date().toISOString();
+let evidenceCleanupTimer = null;
 
 function publicUser(user) {
   if (!user) return null;
@@ -508,6 +508,88 @@ async function handleApi(request, response, url, rawBodyPromise) {
     return true;
   }
 
+  if (pathname === "/api/cicd/coverage" && method === "POST") {
+    assert(Boolean(config.ciWebhookSecret), 503, "ci_webhook_not_configured", "Configure CI_WEBHOOK_SECRET before accepting CI coverage reports.");
+    const body = await readJson(request, rawBodyPromise);
+    const signature = request.headers["x-ci-signature"];
+    const delivery = request.headers["x-ci-delivery"];
+    assert(typeof signature === "string" && /^sha256=[a-f0-9]{64}$/.test(signature), 401, "invalid_ci_signature", "Provide the CI_WEBHOOK_SECRET HMAC-SHA256 signature.");
+    assert(typeof delivery === "string" && /^[A-Za-z0-9-]{16,100}$/.test(delivery), 400, "invalid_ci_delivery", "A unique CI delivery identifier is required.");
+    const rawBody = await rawBodyPromise(config.maxJsonBytes, "application/json");
+    const expected = Buffer.from(`sha256=${createHmac("sha256", config.ciWebhookSecret).update(rawBody).digest("hex")}`);
+    const provided = Buffer.from(signature);
+    assert(expected.length === provided.length && timingSafeEqual(expected, provided), 401, "invalid_ci_signature", "The CI coverage report signature is invalid.");
+    assert(body.deliveryId === delivery, 400, "ci_delivery_mismatch", "The signed CI payload must include its delivery identifier.");
+    assert(body.metrics && typeof body.metrics === "object" && !Array.isArray(body.metrics), 400, "invalid_coverage_metrics", "Provide signed coverage metrics.");
+    const workflow = body.workflow || "authenticated CI runner";
+    assert(typeof workflow === "string" && workflow.length <= 200 && !/[\u0000-\u001f\u007f]/.test(workflow), 400, "invalid_ci_workflow", "The CI workflow identifier must be a printable string no longer than 200 characters.");
+    const applied = setCoverageMetrics({
+      candidateId: body.candidateId,
+      commitSha: body.commitSha,
+      metrics: body.metrics,
+      signatureActor: workflow,
+      deliveryId: delivery,
+      payloadSha256: createHash("sha256").update(rawBody).digest("hex"),
+    });
+    sendJson(request, response, 200, applied, { ETag: `"${applied.candidate.revision}"` });
+    return true;
+  }
+
+  if (pathname === "/api/github/webhook" && method === "POST") {
+    const rawBody = await rawBodyPromise(config.maxJsonBytes, "application/json");
+    const webhook = await inspectWebhookDelivery(request, rawBody);
+    const repoName = webhook.body.repository?.full_name;
+    assert(
+      typeof repoName === "string" &&
+        repoName.length <= 200 &&
+        config.github.owner &&
+        repoName.toLowerCase() === `${config.github.owner}/${config.github.repo}`.toLowerCase(),
+      403,
+      "webhook_repository_mismatch",
+      "This GitHub event is not from the configured repository.",
+    );
+    const commit = webhook.body.after || webhook.body.check_run?.head_sha || webhook.body.pull_request?.head?.sha;
+    assert(
+      commit === undefined || (typeof commit === "string" && /^[a-f0-9]{40}$/i.test(commit)),
+      400,
+      "invalid_webhook_commit",
+      "A webhook commit reference must be a full 40-character Git SHA.",
+    );
+    const matching = commit
+      ? listCandidates().find(
+          (candidate) =>
+            candidate.commit_sha &&
+            candidate.commit_sha.toLowerCase() === commit.toLowerCase(),
+        )
+      : null;
+    let event = null;
+    let duplicateDelivery = false;
+    withTransaction(() => {
+      duplicateDelivery = !insertWebhookDelivery({
+        provider: "github",
+        deliveryId: webhook.deliveryId,
+        payloadSha256: createHash("sha256").update(rawBody).digest("hex"),
+      });
+      if (matching && !duplicateDelivery) {
+        event = appendEvent({
+          candidateId: matching.id,
+          action: `Received signed GitHub ${webhook.event} event`,
+          detail: `Delivery ${webhook.deliveryId} · Commit ${commit}`,
+          type: "github",
+          payload: { event: webhook.event, deliveryId: webhook.deliveryId, commitSha: commit },
+        });
+      }
+    });
+    if (event) broadcast(event);
+    sendJson(request, response, 202, {
+      accepted: true,
+      duplicateDelivery,
+      matchingCandidate: matching?.id ?? null,
+      event: webhook.event,
+    });
+    return true;
+  }
+
   const session = requireSession(request);
   const actor = actorFor(session);
 
@@ -875,6 +957,7 @@ async function handleApi(request, response, url, rawBodyPromise) {
     }
 
     if (parts.length === 6 && parts[5] === "documents" && method === "POST") {
+      requireRevision(request, session, candidateId);
       assertCsrf(request, session);
       const body = await readJson(request, rawBodyPromise);
       const document = createStageDocument({
@@ -888,6 +971,7 @@ async function handleApi(request, response, url, rawBodyPromise) {
     }
 
     if (parts.length === 6 && parts[5] === "artifacts" && method === "POST") {
+      requireRevision(request, session, candidateId);
       assertCsrf(request, session);
       const body = await readJson(request, rawBodyPromise);
       const artifact = generateCodeProposal({
@@ -937,11 +1021,13 @@ async function handleApi(request, response, url, rawBodyPromise) {
     requireRoles(session, ["admin"]);
     assertCsrf(request, session);
     const body = await readJson(request, rawBodyPromise);
+    requireRevision(request, session, body.candidateId);
     const tag = await createAuthorizedReleaseTag({
       candidateId: body.candidateId,
       tag: body.tag,
       message: body.message,
       actor,
+      request,
     });
     sendJson(request, response, 201, tag);
     return true;
@@ -1028,67 +1114,6 @@ async function handleApi(request, response, url, rawBodyPromise) {
       actor,
     });
     sendJson(request, response, 200, candidate, { ETag: `"${candidate.candidate.revision}"` });
-    return true;
-  }
-
-  if (pathname === "/api/cicd/coverage" && method === "POST") {
-    assert(Boolean(config.ciWebhookSecret), 503, "ci_webhook_not_configured", "Configure CI_WEBHOOK_SECRET before accepting CI coverage reports.");
-    const body = await readJson(request, rawBodyPromise);
-    const signature = request.headers["x-ci-signature"];
-    const delivery = request.headers["x-ci-delivery"];
-    assert(typeof signature === "string" && /^sha256=[a-f0-9]{64}$/.test(signature), 401, "invalid_ci_signature", "Provide the CI_WEBHOOK_SECRET HMAC-SHA256 signature.");
-    assert(typeof delivery === "string" && /^[A-Za-z0-9-]{16,100}$/.test(delivery), 400, "invalid_ci_delivery", "A unique CI delivery identifier is required.");
-    const rawBody = await rawBodyPromise(config.maxJsonBytes, "application/json");
-    const expected = Buffer.from(`sha256=${createHmac("sha256", config.ciWebhookSecret).update(rawBody).digest("hex")}`);
-    const provided = Buffer.from(signature);
-    assert(expected.length === provided.length && timingSafeEqual(expected, provided), 401, "invalid_ci_signature", "The CI coverage report signature is invalid.");
-    assert(body.deliveryId === delivery, 400, "ci_delivery_mismatch", "The signed CI payload must include its delivery identifier.");
-    assert(body.metrics && typeof body.metrics === "object", 400, "invalid_coverage_metrics", "Provide signed coverage metrics.");
-    const applied = setCoverageMetrics({
-      candidateId: body.candidateId,
-      commitSha: body.commitSha,
-      metrics: body.metrics,
-      signatureActor: body.workflow || "authenticated CI runner",
-    });
-    sendJson(request, response, 200, applied, { ETag: `"${applied.candidate.revision}"` });
-    return true;
-  }
-
-  if (pathname === "/api/github/webhook" && method === "POST") {
-    const rawBody = await rawBodyPromise(config.maxJsonBytes, "application/json");
-    const webhook = await inspectWebhookDelivery(request, rawBody);
-    const repoName = webhook.body.repository?.full_name;
-    assert(
-      repoName &&
-        config.github.owner &&
-        repoName.toLowerCase() === `${config.github.owner}/${config.github.repo}`.toLowerCase(),
-      403,
-      "webhook_repository_mismatch",
-      "This GitHub event is not from the configured repository.",
-    );
-    const commit = webhook.body.after || webhook.body.check_run?.head_sha || webhook.body.pull_request?.head?.sha;
-    const matching = commit
-      ? listCandidates().find(
-          (candidate) =>
-            candidate.commit_sha &&
-            candidate.commit_sha.toLowerCase() === commit.toLowerCase(),
-        )
-      : null;
-    if (matching) {
-      const event = appendEvent({
-        candidateId: matching.id,
-        action: `Received signed GitHub ${webhook.event} event`,
-        detail: `Delivery ${webhook.deliveryId} · Commit ${commit}`,
-        type: "github",
-        payload: { event: webhook.event, deliveryId: webhook.deliveryId, commitSha: commit },
-      });
-      broadcast(event);
-    }
-    sendJson(request, response, 202, {
-      accepted: true,
-      matchingCandidate: matching?.id ?? null,
-      event: webhook.event,
-    });
     return true;
   }
 
@@ -1225,17 +1250,28 @@ server.headersTimeout = 10_000;
 server.requestTimeout = 45_000;
 server.keepAliveTimeout = 5_000;
 
-export function listen() {
+export async function listen() {
+  await flushEvidenceCleanup();
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(config.port, config.host, () => {
       server.removeListener("error", reject);
+      evidenceCleanupTimer = setInterval(() => {
+        void flushEvidenceCleanup().catch((error) => {
+          console.error("Evidence cleanup retry failed.", error);
+        });
+      }, 60_000);
+      evidenceCleanupTimer.unref();
       resolve(server);
     });
   });
 }
 
 export async function close() {
+  if (evidenceCleanupTimer) {
+    clearInterval(evidenceCleanupTimer);
+    evidenceCleanupTimer = null;
+  }
   for (const client of sseClients) {
     client.response.end();
   }

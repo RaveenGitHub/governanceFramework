@@ -175,6 +175,16 @@ export async function rescanEvidenceFile(evidence) {
   return clamAvScan(data);
 }
 
+export async function removeEvidenceFile(storageName) {
+  assert(
+    typeof storageName === "string" && /^[0-9a-f-]{36}\.[a-z0-9]+$/.test(storageName),
+    500,
+    "evidence_storage_path_invalid",
+    "The stored evidence reference is invalid.",
+  );
+  await rm(path.join(config.evidenceRoot, storageName), { force: true });
+}
+
 export function scannerAvailable() {
   return Boolean(config.clamav.host);
 }

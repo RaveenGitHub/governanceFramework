@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
+import { createServer as createNetServer } from "node:net";
+import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,7 +22,7 @@ async function availablePort() {
   return port;
 }
 
-async function startServer(dataDirectory) {
+async function startServer(dataDirectory, extraEnv = {}) {
   const port = await availablePort();
   const child = spawn(
     process.execPath,
@@ -27,6 +30,7 @@ async function startServer(dataDirectory) {
     {
       env: {
         ...process.env,
+        ...extraEnv,
         PORT: String(port),
         HOST: "127.0.0.1",
         BOOTSTRAP_TOKEN: "test-bootstrap-token-with-at-least-32-bytes",
@@ -255,6 +259,18 @@ test("authenticated API persists candidates and enforces RBAC, CSRF, revisions, 
     body: {},
   });
   assert.equal(confirm.status, 409);
+  const refreshedState = await requestJson(baseUrl, `/api/candidates/${candidateId}/state`, { cookie: adminCookie });
+  const evidenceFile = path.join(dataDirectory, "evidence", `${uploadPayload.evidence.id}.md`);
+  const removeEvidenceResponse = await requestJson(baseUrl, `/api/evidence/${uploadPayload.evidence.id}?candidateId=${candidateId}`, {
+    method: "DELETE",
+    cookie: adminCookie,
+    csrf: setupPayload.csrfToken,
+    etag: refreshedState.headers.get("etag"),
+    body: {},
+  });
+  assert.equal(removeEvidenceResponse.status, 200, output());
+  assert.equal((await removeEvidenceResponse.json()).evidenceCleanupPending, false);
+  await assert.rejects(access(evidenceFile), { code: "ENOENT" });
 
   const addDeveloper = await requestJson(baseUrl, "/api/auth/users", {
     method: "POST",
@@ -267,6 +283,7 @@ test("authenticated API persists candidates and enforces RBAC, CSRF, revisions, 
       password: "correct horse battery staple",
     },
   });
+
   assert.equal(addDeveloper.status, 201, output());
 
   const logout = await requestJson(baseUrl, "/api/auth/logout", {
@@ -315,4 +332,335 @@ test("authenticated API persists candidates and enforces RBAC, CSRF, revisions, 
     body: { username: "governance-admin", password: "correct horse battery staple" },
   });
   assert.equal(persistedLogin.status, 200, restarted.output());
+});
+
+test("signed CI and GitHub webhook retries are acknowledged without duplicate processing", { timeout: 20_000 }, async (context) => {
+  const dataDirectory = await mkdtemp(path.join(os.tmpdir(), "governance-webhooks-"));
+  const ciSecret = "ci-test-secret-that-is-long-enough";
+  const githubSecret = "github-test-secret-that-is-long-enough";
+  const { baseUrl, child, output } = await startServer(dataDirectory, {
+    CI_WEBHOOK_SECRET: ciSecret,
+    GITHUB_TOKEN: "test-token-not-used-for-webhooks",
+    GITHUB_OWNER: "governance-test",
+    GITHUB_REPO: "sample-project",
+    GITHUB_WEBHOOK_SECRET: githubSecret,
+  });
+  context.after(async () => {
+    await stopServer(child);
+    await rm(dataDirectory, { recursive: true, force: true });
+  });
+
+  const setup = await requestJson(baseUrl, "/api/auth/setup", {
+    method: "POST",
+    headers: { "X-Bootstrap-Token": "test-bootstrap-token-with-at-least-32-bytes" },
+    body: { username: "webhook-admin", displayName: "Webhook Admin", password: "correct horse battery staple" },
+  });
+  assert.equal(setup.status, 201, output());
+  const { csrfToken } = await setup.json();
+  const cookie = setup.headers.get("set-cookie").split(";")[0];
+  const candidates = await requestJson(baseUrl, "/api/candidates", { cookie });
+  const [{ id: candidateId }] = (await candidates.json()).candidates;
+  const initial = await requestJson(baseUrl, `/api/candidates/${candidateId}/state`, { cookie });
+  const commitSha = "a".repeat(40);
+  const pin = await requestJson(baseUrl, `/api/candidates/${candidateId}/identity`, {
+    method: "PATCH",
+    cookie,
+    csrf: csrfToken,
+    etag: initial.headers.get("etag"),
+    body: { commitSha },
+  });
+  assert.equal(pin.status, 200, output());
+
+  const githubDelivery = "3b12f1df-5232-4e3f-9a7a-2b89d04f4c31";
+  const githubBody = JSON.stringify({
+    repository: { full_name: "governance-test/sample-project" },
+    after: commitSha,
+  });
+  const githubSignature = createHmac("sha256", githubSecret).update(githubBody).digest("hex");
+  const postGithub = () => fetch(`${baseUrl}/api/github/webhook`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-GitHub-Event": "push",
+      "X-GitHub-Delivery": githubDelivery,
+      "X-Hub-Signature-256": `sha256=${githubSignature}`,
+    },
+    body: githubBody,
+  });
+  const githubAccepted = await postGithub();
+  assert.equal(githubAccepted.status, 202, output());
+  const githubReplay = await postGithub();
+  const githubReplayPayload = await githubReplay.json();
+  assert.equal(githubReplay.status, 202);
+  assert.equal(githubReplayPayload.duplicateDelivery, true);
+
+  const ciDelivery = "5f8ca9f0-c346-4e18-8b43-335ea9698b95";
+  const ciBody = JSON.stringify({
+    candidateId,
+    commitSha,
+    deliveryId: ciDelivery,
+    workflow: "integration-test",
+    metrics: { lineCoverage: 91, branchCoverage: 86, criticalPathCoverage: 100 },
+  });
+  const ciSignature = createHmac("sha256", ciSecret).update(ciBody).digest("hex");
+  const postCi = () => fetch(`${baseUrl}/api/cicd/coverage`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-CI-Delivery": ciDelivery,
+      "X-CI-Signature": `sha256=${ciSignature}`,
+    },
+    body: ciBody,
+  });
+  const ciAccepted = await postCi();
+  assert.equal(ciAccepted.status, 200, output());
+  const ciAcceptedPayload = await ciAccepted.json();
+  assert.equal(ciAcceptedPayload.stages[3].metrics.lineCoverage, 91);
+  const ciReplay = await postCi();
+  const ciReplayPayload = await ciReplay.json();
+  assert.equal(ciReplay.status, 200);
+  assert.equal(ciReplayPayload.duplicateDelivery, true);
+  const conflictingBody = JSON.stringify({
+    candidateId,
+    commitSha,
+    deliveryId: ciDelivery,
+    workflow: "integration-test",
+    metrics: { lineCoverage: 99, branchCoverage: 99, criticalPathCoverage: 100 },
+  });
+  const conflictingSignature = createHmac("sha256", ciSecret).update(conflictingBody).digest("hex");
+  const conflictingReplay = await fetch(`${baseUrl}/api/cicd/coverage`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-CI-Delivery": ciDelivery,
+      "X-CI-Signature": `sha256=${conflictingSignature}`,
+    },
+    body: conflictingBody,
+  });
+  assert.equal(conflictingReplay.status, 409);
+  assert.equal((await conflictingReplay.json()).error.code, "webhook_delivery_conflict");
+
+  const audit = await requestJson(baseUrl, `/api/audit/logs?candidateId=${candidateId}&limit=200`, { cookie });
+  const auditEvents = (await audit.json()).events;
+  assert.equal(auditEvents.filter((item) => item.detail.includes(`Delivery ${githubDelivery}`)).length, 1);
+  assert.equal(
+    auditEvents.filter((item) => item.action === "Recorded authenticated CI coverage metrics").length,
+    1,
+  );
+});
+
+test("GitHub status failures are visible after a persisted gate validation", { timeout: 20_000 }, async (context) => {
+  const dataDirectory = await mkdtemp(path.join(os.tmpdir(), "governance-github-status-"));
+  const scanner = createNetServer((socket) => {
+    socket.once("data", () => socket.end("stream: OK\0"));
+  });
+  scanner.listen(0, "127.0.0.1");
+  await once(scanner, "listening");
+  const scannerPort = scanner.address().port;
+
+  let onCommitStatus;
+  const githubApi = createServer(async (request, response) => {
+    if (request.url?.includes("/statuses/") && onCommitStatus) {
+      const hook = onCommitStatus;
+      onCommitStatus = null;
+      await hook();
+    }
+    response.writeHead(500, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ message: "test status endpoint unavailable" }));
+  });
+  githubApi.listen(0, "127.0.0.1");
+  await once(githubApi, "listening");
+  const githubPort = githubApi.address().port;
+
+  const aiApi = createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ summary: "Evidence reviewed.", findings: [] }) } }],
+    }));
+  });
+  aiApi.listen(0, "127.0.0.1");
+  await once(aiApi, "listening");
+  const aiPort = aiApi.address().port;
+
+  const { baseUrl, child, output } = await startServer(dataDirectory, {
+    CLAMAV_HOST: "127.0.0.1",
+    CLAMAV_PORT: String(scannerPort),
+    GITHUB_TOKEN: "test-token",
+    GITHUB_OWNER: "governance-test",
+    GITHUB_REPO: "sample-project",
+    GITHUB_API_URL: `http://127.0.0.1:${githubPort}`,
+    AI_API_KEY: "test-ai-key",
+    AI_BASE_URL: `http://127.0.0.1:${aiPort}/v1`,
+  });
+  context.after(async () => {
+    await stopServer(child);
+    await Promise.all([
+      new Promise((resolve) => scanner.close(resolve)),
+      new Promise((resolve) => githubApi.close(resolve)),
+      new Promise((resolve) => aiApi.close(resolve)),
+    ]);
+    await rm(dataDirectory, { recursive: true, force: true });
+  });
+
+  const setup = await requestJson(baseUrl, "/api/auth/setup", {
+    method: "POST",
+    headers: { "X-Bootstrap-Token": "test-bootstrap-token-with-at-least-32-bytes" },
+    body: { username: "status-admin", displayName: "Status Admin", password: "correct horse battery staple" },
+  });
+  assert.equal(setup.status, 201, output());
+  const { csrfToken } = await setup.json();
+  const cookie = setup.headers.get("set-cookie").split(";")[0];
+  const candidates = await requestJson(baseUrl, "/api/candidates", { cookie });
+  const [{ id: candidateId }] = (await candidates.json()).candidates;
+  let stateResponse = await requestJson(baseUrl, `/api/candidates/${candidateId}/state`, { cookie });
+  let etag = stateResponse.headers.get("etag");
+  const commitSha = "b".repeat(40);
+  const identity = await requestJson(baseUrl, `/api/candidates/${candidateId}/identity`, {
+    method: "PATCH",
+    cookie,
+    csrf: csrfToken,
+    etag,
+    body: { commitSha },
+  });
+  assert.equal(identity.status, 200, output());
+  etag = identity.headers.get("etag");
+
+  for (let index = 0; index < 4; index += 1) {
+    const checklist = await requestJson(baseUrl, `/api/candidates/${candidateId}/stages/requirements/checklist`, {
+      method: "PUT",
+      cookie,
+      csrf: csrfToken,
+      etag,
+      body: { index, checked: true },
+    });
+    assert.equal(checklist.status, 200, output());
+    etag = checklist.headers.get("etag");
+  }
+  const upload = await fetch(`${baseUrl}/api/evidence/upload?candidateId=${candidateId}&stageId=requirements`, {
+    method: "POST",
+    headers: {
+      Cookie: cookie,
+      "X-CSRF-Token": csrfToken,
+      "If-Match": etag,
+      "Content-Type": "application/octet-stream",
+      "X-Evidence-Filename": Buffer.from("requirements.md").toString("base64url"),
+    },
+    body: Buffer.from("# Requirements\nMeasurable release requirements.", "utf8"),
+  });
+  assert.equal(upload.status, 201, output());
+  const evidence = (await upload.json()).evidence;
+  etag = upload.headers.get("etag");
+
+  const analysis = await requestJson(baseUrl, `/api/candidates/${candidateId}/stages/requirements/analyses`, {
+    method: "POST",
+    cookie,
+    csrf: csrfToken,
+    etag,
+    body: { evidenceIds: [evidence.id] },
+  });
+  assert.equal(analysis.status, 200, output());
+  etag = analysis.headers.get("etag");
+
+  const confirmation = await requestJson(baseUrl, `/api/candidates/${candidateId}/stages/requirements/confirmations`, {
+    method: "POST",
+    cookie,
+    csrf: csrfToken,
+    etag,
+    body: {},
+  });
+  assert.equal(confirmation.status, 200, output());
+
+  onCommitStatus = async () => {
+    const beforeRace = await requestJson(baseUrl, `/api/candidates/${candidateId}/state`, { cookie });
+    const changedDuringSync = await requestJson(baseUrl, `/api/candidates/${candidateId}/identity`, {
+      method: "PATCH",
+      cookie,
+      csrf: csrfToken,
+      etag: beforeRace.headers.get("etag"),
+      body: { commitSha: "c".repeat(40) },
+    });
+    assert.equal(changedDuringSync.status, 200, output());
+  };
+  const validation = await requestJson(baseUrl, `/api/candidates/${candidateId}/stages/requirements/validations`, {
+    method: "POST",
+    cookie,
+    csrf: csrfToken,
+    etag: confirmation.headers.get("etag"),
+    body: {},
+  });
+  assert.equal(validation.status, 200, output());
+  const validationPayload = await validation.json();
+  assert.equal(validationPayload.stages[0].validation, null);
+  assert.equal(validationPayload.stages[0].gateStatus, "not_run");
+  assert.equal(validationPayload.integrations.githubCommitStatus.status, "failed");
+  assert.equal(validationPayload.integrations.candidateChangedDuringSync, true);
+  assert.ok(validationPayload.integrations.githubCommitStatus.errorCode);
+  assert.ok(validationPayload.auditEvents.some((entry) =>
+    entry.action === "GitHub governance status synchronization failed",
+  ));
+  assert.ok(validationPayload.auditEvents.some((entry) =>
+    entry.action === "Passed Requirements validation",
+  ));
+});
+
+test("failed evidence-file deletion remains queued and retries after service restart", { timeout: 20_000 }, async (context) => {
+  const dataDirectory = await mkdtemp(path.join(os.tmpdir(), "governance-evidence-cleanup-"));
+  let { baseUrl, child, output } = await startServer(dataDirectory);
+  let activeChild = child;
+  context.after(async () => {
+    await stopServer(activeChild);
+    await rm(dataDirectory, { recursive: true, force: true });
+  });
+
+  const setup = await requestJson(baseUrl, "/api/auth/setup", {
+    method: "POST",
+    headers: { "X-Bootstrap-Token": "test-bootstrap-token-with-at-least-32-bytes" },
+    body: { username: "cleanup-admin", displayName: "Cleanup Admin", password: "correct horse battery staple" },
+  });
+  assert.equal(setup.status, 201, output());
+  const { csrfToken } = await setup.json();
+  const cookie = setup.headers.get("set-cookie").split(";")[0];
+  const candidates = await requestJson(baseUrl, "/api/candidates", { cookie });
+  const [{ id: candidateId }] = (await candidates.json()).candidates;
+  const candidateState = await requestJson(baseUrl, `/api/candidates/${candidateId}/state`, { cookie });
+  const upload = await fetch(`${baseUrl}/api/evidence/upload?candidateId=${candidateId}&stageId=requirements`, {
+    method: "POST",
+    headers: {
+      Cookie: cookie,
+      "X-CSRF-Token": csrfToken,
+      "If-Match": candidateState.headers.get("etag"),
+      "Content-Type": "application/octet-stream",
+      "X-Evidence-Filename": Buffer.from("requirements.md").toString("base64url"),
+    },
+    body: Buffer.from("# Requirements\nCleanup retry test.", "utf8"),
+  });
+  assert.equal(upload.status, 201, output());
+  const evidence = (await upload.json()).evidence;
+  const evidenceFile = path.join(dataDirectory, "evidence", `${evidence.id}.md`);
+
+  await rm(evidenceFile);
+  await mkdir(path.join(evidenceFile, "blocked"), { recursive: true });
+  await writeFile(path.join(evidenceFile, "blocked", "retain.txt"), "non-empty directory prevents unlink");
+  const current = await requestJson(baseUrl, `/api/candidates/${candidateId}/state`, { cookie });
+  const removal = await requestJson(baseUrl, `/api/evidence/${evidence.id}?candidateId=${candidateId}`, {
+    method: "DELETE",
+    cookie,
+    csrf: csrfToken,
+    etag: current.headers.get("etag"),
+    body: {},
+  });
+  assert.equal(removal.status, 200, output());
+  assert.equal((await removal.json()).evidenceCleanupPending, true);
+
+  await stopServer(child);
+  await rm(evidenceFile, { recursive: true, force: true });
+  const restarted = await startServer(dataDirectory);
+  activeChild = restarted.child;
+  output = restarted.output;
+  const db = new DatabaseSync(path.join(dataDirectory, "governance.sqlite"), { readOnly: true });
+  try {
+    assert.equal(db.prepare("SELECT count(*) AS count FROM evidence_cleanup").get().count, 0);
+  } finally {
+    db.close();
+  }
 });
